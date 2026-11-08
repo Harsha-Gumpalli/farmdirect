@@ -9,6 +9,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY server ./server
 COPY public ./public
+COPY data ./data
 RUN mkdir -p /data/uploads && chown -R node:node /data /app
 USER node
 EXPOSE 3000
