@@ -6,7 +6,10 @@
   const state = {
     token: null, user: null, place: null, radius: 50, cart: null, pickMap: null, maps: [],
     center: { lat: 20, lng: 0 }, located: false, placeLabel: '', dtab: 'overview',
+    units: /-(US|GB|LR|MM)$/i.test(navigator.language || 'en-US') ? 'mi' : 'km', mode: 'visitor',
   };
+  try { const u = localStorage.getItem('fd_units'); if (u === 'mi' || u === 'km') state.units = u; } catch { /* ignore */ }
+  try { const m = localStorage.getItem('fd_mode'); if (m === 'owner' || m === 'visitor') state.mode = m; } catch { /* ignore */ }
   try { state.token = localStorage.getItem('fd_token'); } catch { /* storage unavailable */ }
   try { const p = JSON.parse(localStorage.getItem('fd_place2') || 'null'); if (p && p.slug) setPlaceState(p); } catch { /* ignore */ }
   try { const r = Number(localStorage.getItem('fd_radius')); if (r >= 0) state.radius = r || 50; } catch { /* ignore */ }
@@ -29,7 +32,14 @@
     honey: 'Honey', herbs: 'Herbs', plants: 'Live plants', flowers: 'Flowers', preserves: 'Jams and preserves', nuts: 'Nuts', grains: 'Grains and flour',
     beverages: 'Coffee, tea and drinks', crafts: 'Crafts and soap', other: 'Other' };
   const catName = (c) => CATS[c] || kindLabel(c);
-  const dist = (mi) => (mi == null ? '' : `${mi < 10 ? mi.toFixed(1) : Math.round(mi)} mi`);
+  // Distances are stored in miles; shown in miles or kilometres (switch in the header).
+  const KM = 1.609344;
+  const uLong = () => (state.units === 'km' ? 'km' : 'miles');
+  const toU = (mi) => (state.units === 'km' ? mi * KM : mi);
+  const fromU = (v) => (state.units === 'km' ? v / KM : v);
+  const dist = (mi) => { if (mi == null) return ''; const v = toU(mi); return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${state.units === 'km' ? 'km' : 'mi'}`; };
+  const radText = (mi) => `${Math.round(toU(mi))} ${uLong()}`;
+  function setMode(m) { state.mode = m; try { localStorage.setItem('fd_mode', m); } catch { /* ignore */ } }
   function milesBetween(a, b, c, d) {
     const r = (x) => (x * Math.PI) / 180;
     const h = Math.sin(r(c - a) / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(r(d - b) / 2) ** 2;
@@ -170,6 +180,7 @@
                 <label><input type="radio" name="role" value="buyer" ${role === 'buyer' ? 'checked' : ''}> Buy food and book farm visits</label>
                 <label><input type="radio" name="role" value="farmer" ${role === 'farmer' ? 'checked' : ''}> List my farm, market or stand</label>
               </div>
+              <p class="hint" style="margin-top:.3rem">This only picks where you start. One account can do both: switch between Visitor and Farm owner at the top.</p>
             </fieldset>` : ''}
           <div class="field"><label for="a-email">Email</label><input id="a-email" type="email" autocomplete="email" required></div>
           <div class="field"><label for="a-pass">Password ${tab === 'register' ? '<span class="hint">(8+ characters)</span>' : ''}</label>
@@ -192,7 +203,10 @@
         setSession(data.token, data.user);
         authDialog.close();
         toast(`Welcome, ${data.user.name.split(' ')[0]}.`);
-        if (data.user.role === 'farmer' && (tab === 'register' || /^\/(orders)?$/.test(location.pathname))) navigate('/dashboard'); else route();
+        if (tab === 'register') setMode(body.role === 'farmer' ? 'owner' : 'visitor');
+        else if (data.user.role === 'farmer') setMode('owner');
+        try { state.mine = (await api('/my/farms')).farms[0]?.id || null; } catch { state.mine = null; }
+        if (state.mode === 'owner' && (tab === 'register' || /^\/(orders)?$/.test(location.pathname))) navigate('/dashboard'); else route();
       } catch (ex) { err.textContent = ex.message; }
     });
   }
@@ -201,16 +215,19 @@
 
   // ---------- header and routing ----------
   const SECTIONS = [
-    ['', 'Home'], ['farms', 'Farms'], ['markets', "Farmers' markets"], ['csa', 'CSA'], ['events', 'Events'],
-    ['experiences', 'Farm days and u-pick'], ['products', 'Shop local'], ['photos', 'Photos'],
+    ['', 'Home'], ['farms', 'Farms'], ['experiences', 'Farm visits'], ['barns', 'Barns and ranches'], ['markets', "Farmers' markets"],
+    ['group-orders', 'Group orders'], ['csa', 'CSA'], ['events', 'Events'], ['products', 'Shop local'], ['photos', 'Photos'],
   ];
   function renderChrome() {
     $('#localTo').innerHTML = state.place ? `Local to: <b>${esc(state.place.label)}</b> ▾` : 'Choose your town ▾';
     const u = state.user;
+    const owner = state.mode === 'owner';
+    const sw = `<span class="modesw" role="group" aria-label="See the site as"><button type="button" data-act="mode" data-mode="visitor" aria-pressed="${!owner}">Visitor</button><button type="button" data-act="mode" data-mode="owner" aria-pressed="${owner}">Farm owner</button></span>
+      <button type="button" class="units" data-act="units" aria-label="Show distances in ${state.units === 'km' ? 'miles' : 'kilometres'}" title="Switch miles and kilometres"><span ${state.units === 'mi' ? 'class="on"' : ''}>mi</span><span ${state.units === 'km' ? 'class="on"' : ''}>km</span></button>`;
     $('#account').innerHTML = u
-      ? `${u.role === 'farmer' ? '<a href="/dashboard" data-link>My farm</a>' : '<a href="/orders" data-link>My orders</a>'}
+      ? `${sw}${owner ? '<a href="/dashboard" data-link>My farm</a>' : '<a href="/orders" data-link>My orders</a>'}
          <span class="who">${esc(u.name)}</span><button type="button" data-act="signout">Sign out</button>`
-      : `<button type="button" data-act="signin">Sign in</button><button type="button" class="cta" data-act="list">List your farm</button>`;
+      : `${sw}<button type="button" data-act="signin">Sign in</button><button type="button" class="cta" data-act="list">List your farm</button>`;
     const path = location.pathname.split('/').filter(Boolean);
     const curSec = path[0] === 'farm' || !path.length ? (path.length ? null : '') : (path[1] || '');
     $('#tabs').innerHTML = SECTIONS.map(([k, t]) => {
@@ -224,6 +241,13 @@
     const b = e.target.closest('button'); if (!b) return;
     if (b.dataset.act === 'signout') signOut();
     if (b.dataset.act === 'signin') openAuth('login');
+    if (b.dataset.act === 'units') { state.units = state.units === 'km' ? 'mi' : 'km'; try { localStorage.setItem('fd_units', state.units); } catch { /* ignore */ } route(); toast(`Distances now in ${uLong()}.`); }
+    if (b.dataset.act === 'mode') {
+      setMode(b.dataset.mode);
+      if (b.dataset.mode === 'owner') navigate('/dashboard');
+      else if (/^\/dashboard/.test(location.pathname)) navigate(state.place ? base() : '/');
+      else renderChrome();
+    }
     if (b.dataset.act === 'list') { if (state.user) navigate('/dashboard'); else openAuth('register', 'Create a free account to list your farm, market or stand.', 'farmer'); }
   });
 
@@ -268,6 +292,7 @@
         case 'dashboard': return renderFarmDashboard();
         case 'updates': return renderFeed();
         case 'cities': return renderCities();
+        case 'group': return renderGroup(Number(seg[1]));
       }
       let place;
       try { place = await resolvePlace(seg[0]); } catch { return notFound("We couldn't find that town."); }
@@ -277,6 +302,8 @@
       if (!sec) return place ? renderCity() : renderDirectory('listings');
       if (sec === 'events') return renderEvents();
       if (sec === 'photos') return renderPhotos();
+      if (sec === 'group-orders') return renderGroups();
+      if (sec === 'experiences') return renderDirectory('experiences', '', VISITS.some(([k]) => k && k === seg[2]) ? seg[2] : '');
       if (sec === 'products' && !seg[2]) return renderProducts();
       if (sec === 'products') return renderDirectory('products', seg[2]);
       if (DIR[sec]) return renderDirectory(sec);
@@ -449,11 +476,12 @@
       </div>
       ${orderLines(o)}
       <p><strong>${money(total, o.currency)}</strong> ${o.delivery_fee_cents ? `(includes ${money(o.delivery_fee_cents, o.currency)} delivery)` : ''}</p>
-      <p class="meta">${o.fulfillment === 'pickup'
+      ${o.group_id ? `<p class="meta"><span class="badge">Group order</span> Drop-off at ${esc(o.group_dropoff)} on ${niceDate(o.group_date)} · <a href="/group/${o.group_id}" data-link>see the group</a>
+        ${o.group_discount ? `<br><strong>${o.group_discount}% group discount: you pay ${money(Math.round(total * (1 - o.group_discount / 100)), o.currency)}</strong>` : ''}</p>` : `<p class="meta">${o.fulfillment === 'pickup'
         ? `Pickup at ${esc(o.farm_address || o.farm_city)}. ${esc(o.pickup_instructions || '')}`
         : `Delivery to ${esc(o.delivery_address)}`}
-        ${o.scheduled_for ? `<br>Requested time: ${esc(o.scheduled_for.replace('T', ' '))}` : ''}</p>
-      ${o.fulfillment === 'pickup' ? `<p>${gmLink(gmDir(o.farm_address ? `${o.farm_address}, ${o.farm_city}, TX` : `${o.farm_lat},${o.farm_lng}`), 'Directions to the farm')}</p>` : ''}
+        ${o.scheduled_for ? `<br>Requested time: ${esc(o.scheduled_for.replace('T', ' '))}` : ''}</p>`}
+      ${o.fulfillment === 'pickup' && !o.group_id ? `<p>${gmLink(gmDir(o.farm_address ? `${o.farm_address}, ${o.farm_city}, TX` : `${o.farm_lat},${o.farm_lng}`), 'Directions to the farm')}</p>` : ''}
       <p class="meta">${esc(o.payment_note)}${o.farm_phone ? ` Phone: ${esc(o.farm_phone)}` : ''}</p>
       ${active ? `<p style="margin-top:.5rem"><button class="btn small danger" data-cancel="${o.id}">Cancel order</button></p>` : ''}
     </article>`;
@@ -576,7 +604,7 @@
   function postHtml(p, { farm = null, canDelete = false } = {}) {
     return `<article class="post">
       <div class="post-hd"><div>${farm ? `<button class="linkish" data-farm="${farm.id}">${esc(farm.name)}</button>
-        <div class="hint">${esc(kindLabel(farm.kind))} in ${esc(farm.city || '')}${farm.distance_miles != null ? `, ${farm.distance_miles.toFixed(1)} mi away` : ''}</div>` : ''}</div>
+        <div class="hint">${esc(kindLabel(farm.kind))} in ${esc(farm.city || '')}${farm.distance_miles != null ? `, ${dist(farm.distance_miles)} away` : ''}</div>` : ''}</div>
         <span class="hint">${when2(p.created_at)}</span></div>
       ${p.body ? `<p class="txt">${esc(p.body)}</p>` : ''}
       ${mediaHtml(p.media)}
@@ -812,7 +840,7 @@
         <div class="field"><label for="fm-pinst">Pickup instructions</label><input id="fm-pinst" type="text" value="${esc(f.pickup_instructions)}" placeholder="Farm stand by the red barn, open 9 to 5"></div>
         <label class="check"><input type="checkbox" id="fm-deliv" ${f.delivery_enabled ? 'checked' : ''}> I deliver</label>
         <div class="row">
-          <div class="field"><label for="fm-rad">Delivery radius (miles)</label><input id="fm-rad" type="number" min="1" step="1" value="${esc(f.delivery_radius_miles || 10)}"></div>
+          <div class="field"><label for="fm-rad">Delivery radius (${uLong()})</label><input id="fm-rad" type="number" min="1" step="1" value="${Math.round(toU(f.delivery_radius_miles || 10))}"></div>
           <div class="field"><label for="fm-fee">Delivery fee</label><input id="fm-fee" type="number" min="0" step="0.5" value="${((f.delivery_fee_cents || 0) / 100).toFixed(2)}"></div>
         </div>
         <div class="row">
@@ -866,9 +894,10 @@
         address: $('#fm-addr').value, city: $('#fm-city').value, phone: $('#fm-phone').value,
         lat: $('#fm-lat').value, lng: $('#fm-lng').value,
         pickup_enabled: $('#fm-pickup').checked, pickup_instructions: $('#fm-pinst').value,
-        delivery_enabled: $('#fm-deliv').checked, delivery_radius_miles: $('#fm-rad').value, delivery_fee: $('#fm-fee').value,
+        delivery_enabled: $('#fm-deliv').checked, delivery_radius_miles: fromU(Number($('#fm-rad').value)), delivery_fee: $('#fm-fee').value,
         payment_note: $('#fm-pay').value, currency: $('#fm-cur').value,
         hours: $('#fm-hours').value, website: $('#fm-web').value, accepts_snap: $('#fm-snap').checked, wholesale: $('#fm-whole').checked,
+        ...(farm ? groupBody(farm) : {}),
       };
       try {
         await api(farm ? '/farms/' + farm.id : '/farms', { method: farm ? 'PUT' : 'POST', body });
@@ -913,27 +942,33 @@
   }
 
   // ---------- city page ----------
-  const NEAR_LINKS = [['farms', 'farms'], ['markets', 'markets'], ['upick', 'u-pick', 'u-pick'], ['farmstands', 'farm stands', 'farm-stands'], ['csa', 'CSA'],
-    ['experiences', 'farm days', 'experiences'], ['events', 'events'], ['restaurants', 'restaurants'], ['groceries', 'groceries'], ['all', 'all listings', 'listings']];
+  const NEAR_LINKS = [['farms', 'farms'], ['experiences', 'farm visits', 'experiences'], ['barns', 'barns and ranches', 'barns'], ['markets', 'markets'], ['groups', 'group orders', 'group-orders'],
+    ['upick', 'u-pick', 'u-pick'], ['farmstands', 'farm stands', 'farm-stands'], ['csa', 'CSA'], ['events', 'events'], ['restaurants', 'restaurants'], ['groceries', 'groceries'], ['all', 'all listings', 'listings']];
   async function renderCity() {
     const p = state.place;
     loading(`Local food near ${p.label}`);
     const d = await api(`/local?lat=${p.lat}&lng=${p.lng}&radius=${state.radius || 50}`);
     const town = townName();
     const seasonName = { fall: 'this fall', winter: 'this winter', spring: 'this spring', summer: 'this summer' }[d.in_season.season];
-    const near = NEAR_LINKS.filter(([k]) => d.counts[k] > 0 || ['farms', 'markets', 'csa', 'events'].includes(k))
+    const near = NEAR_LINKS.filter(([k]) => d.counts[k] > 0 || ['farms', 'experiences', 'markets', 'csa', 'events'].includes(k))
       .map(([k, label, path]) => `<a href="${base()}/${path || k}" data-link>${esc(label)} <span>${d.counts[k] || 0}</span></a>`).join('');
     const fcard = (f) => `<a class="fcard" href="/farm/${f.id}" data-link>${thumb(f)}<div class="body"><h3>${esc(f.name)}</h3>
       <span class="meta">${esc(kindName(f.kind))}, ${esc(f.place_label)}${f.distance_miles != null ? ` · ${dist(f.distance_miles)}` : ''}</span></div></a>`;
     view.innerHTML = `<div class="wrap page">
       <div class="city-hd"><h1>Local food near ${esc(p.label)}</h1>
-        <div class="sub"><span class="muted">Within ${state.radius || 50} miles. Listings are posted by the farms and markets themselves.</span><a class="more" href="/cities" data-link>see more towns ›</a></div></div>
+        <div class="sub"><span class="muted">Within ${radText(state.radius || 50)}. Listings are posted by the farms and markets themselves.</span><a class="more" href="/cities" data-link>see more towns ›</a></div></div>
       <nav class="near" aria-label="Near ${esc(town)}"><b>Near ${esc(town)}:</b>${near}<a href="${base()}/photos" data-link>photos</a></nav>
+      <section class="visits"><div class="sec-hd"><h2>Visit a farm near ${esc(town)}</h2><a class="more" href="${base()}/experiences" data-link>all farm visits ›</a></div>
+        <div class="vtiles">${VISITS.slice(1).map(([k, t]) => { const c = d.counts['exp_' + k] || 0; return `<a class="vt vt-${k}" href="${base()}/experiences/${k}" data-link><b>${esc(t)}</b><span>${c ? `${c} ${c === 1 ? 'place' : 'places'}` : 'None listed yet'}</span></a>`; }).join('')}
+          <a class="vt vt-barn" href="${base()}/barns" data-link><b>Barns and ranches</b><span>${d.counts.barns ? `${d.counts.barns} nearby, with their produce` : 'None listed yet'}</span></a></div></section>
       ${d.counts.all ? '' : `<div class="notice">Nothing is listed near ${esc(town)} yet. Know a farm, market or stand here? <a href="/dashboard" data-link>List it free</a>, or <button class="linkish" type="button" id="widen">look further away</button>.</div>`}
       <div class="city-grid">
         <div class="page" style="gap:1.25rem">
           <section class="card"><div class="sec-hd"><h2>Featured farms</h2><a class="more" href="${base()}/farms" data-link>search all farms ›</a></div>
             ${d.featured.length ? `<div class="fcards">${d.featured.map(fcard).join('')}</div>` : '<p class="empty">No farms listed nearby yet.</p>'}</section>
+          <section class="card"><div class="sec-hd"><h2>Group orders near ${esc(town)}</h2><a class="more" href="${base()}/group-orders" data-link>how group orders work ›</a></div>
+            <p class="hint" style="margin-bottom:.6rem">Neighbors order together so the farm makes one trip to one drop-off spot, often with a bulk discount.</p>
+            ${d.groups && d.groups.length ? `<div class="rows">${d.groups.map(groupRow).join('')}</div>` : `<p class="empty">No open group orders nearby. <a href="${base()}/group-orders" data-link>Start one for your street or office</a>.</p>`}</section>
           <section class="card"><div class="sec-hd"><h2>Farmers' markets</h2><a class="more" href="${base()}/markets" data-link>local farmers' markets ›</a></div>
             ${d.markets.length ? `<ul class="mlist">${d.markets.map((m) => `<li><span><a href="/farm/${m.id}" data-link>${esc(m.name)}</a><br><span class="meta">${esc(m.hours || m.place_label)}</span></span><span class="meta tnum">${dist(m.distance_miles)}</span></li>`).join('')}</ul>` : '<p class="empty">No markets listed nearby yet. Run one? <a href="/dashboard" data-link>List it free</a>.</p>'}</section>
           <section class="card"><div class="sec-hd"><h2>From your local farmers</h2><a class="more" href="${base()}/products" data-link>more local products ›</a></div>
@@ -943,7 +978,7 @@
             <p class="meta" style="margin:.7rem 0 .4rem">Usually in season ${seasonName}:</p><div class="chips">${d.in_season.typical.map((n) => `<span class="chip">${esc(n)}</span>`).join('')}</div></section>
           <section class="card"><div class="sec-hd"><h2>Photo gallery</h2><a class="more" href="${base()}/photos" data-link>local farm photos ›</a></div>
             ${d.gallery.length ? `<div class="gallery">${d.gallery.map(galleryItem).join('')}</div>` : '<p class="empty">No photos yet. Farmers can add photos from their dashboard.</p>'}</section>
-          ${d.experiences.length ? `<section class="card"><div class="sec-hd"><h2>Farm days, classes and u-pick</h2><a class="more" href="${base()}/experiences" data-link>all farm experiences ›</a></div>
+          ${d.experiences.length ? `<section class="card"><div class="sec-hd"><h2>Farm visits: rides, farm days, classes and u-pick</h2><a class="more" href="${base()}/experiences" data-link>all farm visits ›</a></div>
             <ul class="mlist">${d.experiences.map((e) => `<li><span><a href="/farm/${e.farm_id}#experiences" data-link>${esc(e.title)}</a><br><span class="meta">${esc(e.farm_name)} · ${esc(EXP_TYPES[e.type] || 'Experience')}</span></span><span class="meta">${esc(expPrice(e, e.currency))}</span></li>`).join('')}</ul></section>` : ''}
         </div>
         <aside class="city-side">
@@ -970,14 +1005,18 @@
   const DIR = {
     listings: { type: '', title: 'All local listings' }, farms: { type: 'farms', title: 'Farms' }, markets: { type: 'markets', title: "Farmers' markets" },
     'u-pick': { type: 'upick', title: 'U-pick farms' }, 'farm-stands': { type: 'farmstands', title: 'Farm stands' }, csa: { type: 'csa', title: 'CSA farms' },
-    experiences: { type: 'experiences', title: 'Farm days, classes, rides and u-pick' }, wholesale: { type: 'wholesale', title: 'Wholesale farms' },
+    experiences: { type: 'experiences', title: 'Farm visits' }, barns: { type: 'barns', title: 'Barns and ranches' }, wholesale: { type: 'wholesale', title: 'Wholesale farms' },
     restaurants: { type: 'restaurants', title: 'Farm-to-table restaurants' }, groceries: { type: 'groceries', title: 'Groceries and co-ops' },
     snap: { type: 'snap', title: 'Places that accept SNAP/EBT' }, others: { type: 'others', title: 'Other local food' }, products: { type: '', title: 'Local products' },
   };
-  const FILTERS = [['listings', 'Show all'], ['farms', 'Farms'], ['markets', "Farmers' markets"], ['u-pick', 'U-pick'], ['farm-stands', 'Farm stands'], ['csa', 'CSA'],
-    ['experiences', 'Farm days'], ['wholesale', 'Wholesale'], ['restaurants', 'Restaurants'], ['groceries', 'Groceries'], ['snap', 'Accepts SNAP'], ['others', 'Others']];
-  async function renderDirectory(sec, product = '') {
-    const d = DIR[sec];
+  const FILTERS = [['listings', 'Show all'], ['farms', 'Farms'], ['experiences', 'Farm visits'], ['barns', 'Barns and ranches'], ['markets', "Farmers' markets"], ['u-pick', 'U-pick'], ['farm-stands', 'Farm stands'], ['csa', 'CSA'],
+    ['wholesale', 'Wholesale'], ['restaurants', 'Restaurants'], ['groceries', 'Groceries'], ['snap', 'Accepts SNAP'], ['others', 'Others']];
+  const VISITS = [['', 'All farm visits'], ['horse', 'Horseback riding'], ['day', 'Spend a day on a farm'], ['learn', 'Learn farming'], ['tour', 'Farm and barn tours'], ['pick', 'U-pick']];
+  const VISIT_BLURB = { horse: 'Trail rides, lessons and pony rides at barns and ranches.', day: 'Feed animals, collect eggs, help with chores and eat what you picked.',
+    learn: 'Hands-on classes: growing vegetables, keeping chickens, beekeeping, cheesemaking.', tour: 'Walk the fields and barns with the people who run them.', pick: 'Pick your own fruit, berries, pumpkins and flowers.' };
+  async function renderDirectory(sec, product = '', xtype = '') {
+    const d = { ...DIR[sec] };
+    if (xtype) { d.type = 'exp:' + xtype; d.title = VISITS.find(([k]) => k === xtype)[1]; }
     const where = state.place && location.pathname.split('/')[1] !== 'all' ? state.place : null;
     const title = product ? `${catName(product)} ${where ? `near ${where.label}` : 'from local farms'}` : `${d.title} ${where ? `near ${where.label}` : 'everywhere'}`;
     const params = new URLSearchParams(location.search);
@@ -985,10 +1024,14 @@
     view.innerHTML = `<div class="wrap page">
       <div><h1>${esc(title)}</h1>${where ? '' : '<p class="muted">Choose your town at the top to see the closest first.</p>'}</div>
       <nav class="filterrow" aria-label="Type of place">${FILTERS.map(([k, t]) => `<a href="${base()}/${k}" data-link ${k === sec ? 'aria-current="page"' : ''}>${esc(t)}</a>`).join('')}</nav>
+      ${sec === 'experiences' ? `<div class="visit-intro"><p>Book time on a working farm, barn or ranch. You send a request, the owner confirms, and you pay them directly when you arrive.</p>
+        <nav class="pills" aria-label="Kind of visit">${VISITS.map(([k, t]) => `<a href="${base()}/experiences${k ? '/' + k : ''}" data-link ${k === xtype ? 'aria-current="page"' : ''}>${esc(t)}</a>`).join('')}</nav>
+        ${xtype ? `<p class="meta">${esc(VISIT_BLURB[xtype])}</p>` : ''}</div>` : ''}
+      ${sec === 'barns' ? '<p class="muted">Barns and ranches near you: horses and riding, eggs, meat, hay and barn-raised produce, farm days and tours.</p>' : ''}
       <form class="toolbar" id="dirForm" role="search">
         <div class="field"><label for="d-q">Search</label><input id="d-q" type="search" value="${esc(q)}" placeholder="name, product or town"></div>
         <div class="field"><label for="d-prod">Product</label><select id="d-prod"><option value="">Any product</option>${Object.entries(CATS).map(([k, t]) => `<option value="${k}" ${k === product ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></div>
-        <div class="field"><label for="d-rad">Within</label><select id="d-rad" ${where ? '' : 'disabled'}>${[10, 25, 50, 100, 250, 0].map((r) => `<option value="${r}" ${state.radius === r ? 'selected' : ''}>${r ? r + ' miles' : 'Any distance'}</option>`).join('')}</select></div>
+        <div class="field"><label for="d-rad">Within</label><select id="d-rad" ${where ? '' : 'disabled'}>${[10, 25, 50, 100, 250, 0].map((r) => `<option value="${r}" ${state.radius === r ? 'selected' : ''}>${r ? radText(r) : 'Any distance'}</option>`).join('')}</select></div>
       </form>
       <p class="meta" id="d-count" aria-live="polite"></p>
       <div class="dir"><ul class="results" id="d-list"><li class="hint">Loading…</li></ul><div id="d-map" class="map" role="region" aria-label="Map of results"></div></div>
@@ -1002,7 +1045,7 @@
       const qq = $('#d-q').value.trim(); if (qq) qs.set('q', qq);
       const { farms } = await api('/farms?' + qs);
       $('#d-count').textContent = `${farms.length} ${farms.length === 1 ? 'result' : 'results'}`;
-      $('#d-list').innerHTML = farms.length ? farms.map((f) => resultRow(f, prod)).join('')
+      $('#d-list').innerHTML = farms.length ? farms.map((f) => resultRow(f, prod, sec === 'experiences' ? xtype || '*' : '')).join('')
         : `<li class="empty"><strong>Nothing found.</strong> Try a wider distance, another type, or <a href="/dashboard" data-link>list your own farm</a>.</li>`;
       map.clear();
       farms.forEach((f) => map.addPin(f.lat, f.lng, { title: f.name, kind: f.kind, onClick: () => navigate('/farm/' + f.id) }));
@@ -1015,7 +1058,7 @@
     $('#d-rad').addEventListener('change', () => { state.radius = Number($('#d-rad').value); try { localStorage.setItem('fd_radius', String(state.radius)); } catch { /* ignore */ } load(); });
     await load();
   }
-  function resultRow(f, prod) {
+  function resultRow(f, prod, visits = '') {
     const items = (prod ? f.items.filter((i) => i.category === prod) : f.items).slice(0, 6);
     const extra = [];
     if (f.csa_count) extra.push('<span class="chip how">CSA shares</span>');
@@ -1026,6 +1069,8 @@
       <div class="sec-hd" style="margin:0"><h3><a href="/farm/${f.id}" data-link>${esc(f.name)}</a></h3><span class="meta tnum">${dist(f.distance_miles)}</span></div>
       <div class="meta">${badges(f)} ${esc(f.place_label || f.city)}${f.hours ? ` · ${esc(f.hours)}` : ''}</div>
       ${f.description ? `<p class="desc">${esc(f.description)}</p>` : ''}
+      ${visits ? `<ul class="xplist">${f.experiences.filter((e) => visits === '*' || e.type === visits).map((e) => `<li><a href="/farm/${f.id}#experiences" data-link><b>${esc(e.title)}</b></a>
+        <span class="meta">${esc(EXP_SHORT[e.type])}${e.duration ? ` · ${esc(e.duration)}` : ''}${e.min_age ? ` · ages ${e.min_age}+` : ''}</span><span class="price">${esc(expPrice(e, f.currency))}</span></li>`).join('')}</ul>` : ''}
       ${extra.length || items.length ? `<div class="chips">${extra.join('')}${items.map((i) => `<span class="chip price">${esc(i.name)} ${money(i.price_cents, f.currency)}/${esc(i.unit)}</span>`).join('')}${f.experiences.filter((e) => e.type !== 'pick').slice(0, 2).map((e) => `<span class="chip xp">${esc(e.title)}</span>`).join('')}</div>` : ''}
     </div></li>`;
   }
@@ -1069,10 +1114,11 @@
     loading('Loading');
     let d;
     try { d = await api('/farms/' + id); } catch { return notFound('That listing was removed or never existed.'); }
+    try { d.groups = (await api('/groups?farm_id=' + id)).groups; } catch { d.groups = []; }
     const f = d.farm, mi = fromHere(f);
-    const own = state.user && state.user.role === 'farmer' && state.mine === f.id;
+    const own = !!state.user && state.mine === f.id;
     state.cart = state.cart && state.cart.farm.id === f.id ? { ...state.cart, farm: f, listings: d.listings } : { farm: f, listings: d.listings, lines: {} };
-    const sections = [['about', 'About'], d.listings.length && ['products', 'Products'], d.csa.length && ['csa', 'CSA'], d.experiences.length && ['experiences', 'Farm days'],
+    const sections = [['about', 'About'], d.listings.length && ['products', 'Products'], (d.farm.group_orders || d.groups.length) && ['groups', 'Group orders'], d.csa.length && ['csa', 'CSA'], d.experiences.length && ['experiences', 'Farm visits'],
       d.events.length && ['events', 'Events'], d.posts.length && ['updates', 'Updates'], ['location', 'Location']].filter(Boolean);
     document.title = `${f.name}: ${kindName(f.kind)} in ${f.place_label || f.city} | FarmDirect`;
     view.innerHTML = `<div class="wrap page">
@@ -1087,8 +1133,14 @@
       <div class="lp-grid"><div class="page" style="gap:1.25rem">
         <section class="card" id="about"><h2>About ${esc(f.name)}</h2><p>${esc(f.description || 'No description yet.')}</p></section>
         ${d.listings.length ? `<section class="card" id="products"><h2>For sale now</h2><div class="rows" id="lp-items"></div><div id="cartBox" style="margin-top:.8rem"></div></section>` : ''}
+        ${f.group_orders || d.groups.length ? `<section class="card" id="groups"><h2>Order with your neighbors</h2>
+          <p style="margin-bottom:.6rem">${esc(f.name)} delivers group orders: everyone on a street, at an office or a school orders by one deadline, and the farm brings it all in one trip to one drop-off spot.
+          ${groupTerms(f)}</p>
+          ${d.groups.length ? `<div class="rows">${d.groups.map(groupRow).join('')}</div>` : '<p class="empty">No open group orders right now.</p>'}
+          ${f.group_orders && !own ? '<div class="btn-group" style="margin-top:.7rem"><button class="btn" type="button" id="startGroup">Start a group order</button><span class="hint">You choose the drop-off spot and dates. Neighbors join with a link.</span></div>' : ''}
+          ${own ? '<p class="hint" style="margin-top:.6rem">Visitors see a Start a group order button here. Manage drop-offs in your dashboard under Group orders.</p>' : ''}</section>` : ''}
         ${d.csa.length ? `<section class="card" id="csa"><h2>CSA shares</h2><p class="hint" style="margin-bottom:.6rem">Sign up for a weekly share of the harvest. The farm confirms your spot and tells you how to pay.</p><div class="rows">${d.csa.map((c) => offerHtml('csa', c, f)).join('')}</div></section>` : ''}
-        ${d.experiences.length ? `<section class="card" id="experiences"><h2>Farm days, classes and u-pick</h2><div class="rows">${d.experiences.map((e) => offerHtml('exp', e, f)).join('')}</div></section>` : ''}
+        ${d.experiences.length ? `<section class="card" id="experiences"><h2>Visit the farm</h2><div class="rows">${d.experiences.map((e) => offerHtml('exp', e, f)).join('')}</div></section>` : ''}
         ${d.events.length ? `<section class="card" id="events"><h2>Upcoming events</h2><div class="rows">${d.events.map((e) => offerHtml('event', e, f)).join('')}</div></section>` : ''}
         ${d.posts.length ? `<section class="card" id="updates"><h2>Updates from the farm</h2><div class="rows">${d.posts.map((p) => postHtml(p)).join('')}</div></section>` : ''}
       </div>
@@ -1098,7 +1150,7 @@
           ${f.address ? `<p><strong>Address:</strong> ${esc(f.address)}, ${esc(f.city || f.place_label)}</p>` : `<p><strong>Near:</strong> ${esc(f.place_label)}</p>`}
           ${f.hours ? `<p><strong>Hours:</strong> ${esc(f.hours)}</p>` : ''}
           ${d.listings.length && f.pickup_enabled ? `<p><strong>Pickup:</strong> ${esc(f.pickup_instructions || 'Arrange a time with the farmer.')}</p>` : ''}
-          ${f.delivery_enabled ? `<p><strong>Delivery:</strong> within ${qtyText(f.delivery_radius_miles)} miles, ${f.delivery_fee_cents ? money(f.delivery_fee_cents, f.currency) + ' fee' : 'free'}</p>` : ''}
+          ${f.delivery_enabled ? `<p><strong>Delivery:</strong> within ${radText(f.delivery_radius_miles)}, ${f.delivery_fee_cents ? money(f.delivery_fee_cents, f.currency) + ' fee' : 'free'}</p>` : ''}
           <p><strong>Payment:</strong> ${esc(f.payment_note)}</p>
           ${f.accepts_snap ? '<p><strong>SNAP/EBT:</strong> accepted</p>' : ''}
         </div></section></aside></div></div>`;
@@ -1106,6 +1158,7 @@
     map.addPin(f.lat, f.lng, { title: f.name, kind: f.kind });
     if (d.listings.length) drawItems();
     bindOffers(f, own);
+    $('#startGroup')?.addEventListener('click', () => openStartGroup(f));
     if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
   }
 
@@ -1137,7 +1190,6 @@
     view.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => {
       if (own) return toast('This is your own listing.', true);
       if (!state.user) return openAuth('login', 'Sign in or create a free account to continue.');
-      if (state.user.role !== 'buyer') return toast('Use a buyer account for this. Farm accounts manage listings.', true);
       const form = $('#form-' + b.dataset.open); form.hidden = false; form.querySelector('input')?.focus();
     }));
     view.querySelectorAll('[data-shut]').forEach((b) => b.addEventListener('click', () => { $('#form-' + b.dataset.shut).hidden = true; }));
@@ -1205,7 +1257,6 @@
       e.preventDefault();
       const err = $('#coError'); err.textContent = '';
       if (!state.user) return openAuth('login', 'Sign in or create a free account to reserve.');
-      if (state.user.role !== 'buyer') { err.textContent = 'Use a buyer account to place orders.'; return; }
       const body = { farm_id: farm.id, fulfillment: how(), items: lines.map((l) => ({ listing_id: l.listing.id, qty: l.qty })), scheduled_for: $('#c-when').value, note: $('#c-note').value };
       if (how() === 'delivery') { body.delivery_address = $('#c-addr').value; if (state.place) { body.buyer_lat = state.place.lat; body.buyer_lng = state.place.lng; } }
       try {
@@ -1220,15 +1271,16 @@
   // ---------- buyer: orders, bookings, CSA, events ----------
   async function renderOrders() {
     if (!state.user) { view.innerHTML = '<div class="wrap page"><h1>My orders</h1><p class="empty">Sign in to see your orders.</p></div>'; return openAuth('login'); }
-    if (state.user.role !== 'buyer') return navigate('/dashboard');
+    if (state.mode !== 'visitor') { setMode('visitor'); renderChrome(); }
     loading('My orders');
-    const [{ orders }, { bookings }, { signups }, { rsvps }] = await Promise.all([api('/orders/mine'), api('/bookings/mine'), api('/csa-signups/mine'), api('/rsvps/mine')]);
+    const [{ orders }, { bookings }, { signups }, { rsvps }, { groups: hosting }] = await Promise.all([api('/orders/mine'), api('/bookings/mine'), api('/csa-signups/mine'), api('/rsvps/mine'), api('/groups-hosting')]);
     view.innerHTML = `<div class="wrap page"><h1>My orders</h1>
+      ${hosting.length ? `<section><h2 style="margin-bottom:.6rem">Group orders you're hosting</h2><div class="rows">${hosting.map(groupRow).join('')}</div></section>` : ''}
       <section><h2 style="margin-bottom:.6rem">Produce orders</h2>${orders.length ? `<div class="rows">${orders.map(buyerOrder).join('')}</div>` : `<p class="empty">No orders yet. <a href="${base()}/products" data-link>Shop local</a>.</p>`}</section>
       <section><h2 style="margin-bottom:.6rem">CSA memberships</h2>${signups.length ? `<div class="rows">${signups.map((s) => `<article class="order"><div class="item-row" style="border:0;padding:0"><div><h3>${esc(s.title)}</h3><div class="meta">${esc(s.farm_name)}${s.season ? ` · ${esc(s.season)}` : ''}${s.pickup ? ` · Pickup: ${esc(s.pickup)}` : ''}</div></div><span class="status ${esc(s.status)}">${esc(kindLabel(s.status === 'requested' ? 'waiting for farm' : s.status))}</span></div>
         <p><strong>${money(s.price_cents, s.currency)} ${esc(CSA_PER[s.per])}</strong>, paid to the farm. ${esc(s.payment_note)}</p>
         ${['requested', 'confirmed'].includes(s.status) ? `<div class="btn-group"><button class="btn small danger" data-csacancel="${s.id}">Cancel membership</button></div>` : ''}</article>`).join('')}</div>` : `<p class="empty">No CSA shares yet. <a href="${base()}/csa" data-link>Find a CSA</a>.</p>`}</section>
-      <section><h2 style="margin-bottom:.6rem">Farm days and classes</h2>${bookings.length ? `<div class="rows">${bookings.map(guestBooking).join('')}</div>` : `<p class="empty">No bookings yet. <a href="${base()}/experiences" data-link>Find farm days, classes and rides</a>.</p>`}</section>
+      <section><h2 style="margin-bottom:.6rem">Farm visits</h2>${bookings.length ? `<div class="rows">${bookings.map(guestBooking).join('')}</div>` : `<p class="empty">No bookings yet. <a href="${base()}/experiences" data-link>Find farm visits: riding, farm days, classes and tours</a>.</p>`}</section>
       <section><h2 style="margin-bottom:.6rem">Events</h2>${rsvps.length ? `<div class="rows">${rsvps.map((r) => `<article class="order"><div class="item-row" style="border:0;padding:0"><div><h3>${esc(r.title)}</h3><div class="meta">${esc(r.farm_name)} · ${new Date(r.date + 'T12:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}${r.start_time ? `, ${fmtTime(r.start_time)}` : ''} · ${r.people} ${r.people === 1 ? 'person' : 'people'}</div></div><span class="status ${esc(r.status)}">${r.status === 'going' ? 'Going' : 'Cancelled'}</span></div>
         <p>${gmLink(gmDir(r.address || `${r.lat},${r.lng}`), 'Directions')}</p>${r.status === 'going' ? `<div class="btn-group"><button class="btn small danger" data-rsvpcancel="${r.id}">Cancel RSVP</button></div>` : ''}</article>`).join('')}</div>` : `<p class="empty">No events yet. <a href="${base()}/events" data-link>See what's on</a>.</p>`}</section></div>`;
     const act = async (fn, msg) => { try { await fn(); toast(msg); renderOrders(); } catch (e) { toast(e.message, true); } };
@@ -1244,7 +1296,7 @@
     const q = new URLSearchParams(state.place ? { lat: state.place.lat, lng: state.place.lng, radius: 100 } : {});
     const { posts } = await api('/feed?' + q);
     view.innerHTML = `<div class="wrap page" style="max-width:780px"><h1>Farm updates</h1>
-      <p class="muted">Photos, videos and news from farms ${state.place ? `within 100 miles of ${esc(state.place.label)}` : 'everywhere'}.</p>
+      <p class="muted">Photos, videos and news from farms ${state.place ? `within ${radText(100)} of ${esc(state.place.label)}` : 'everywhere'}.</p>
       ${posts.length ? posts.map((p) => postHtml(p, { farm: { id: p.farm_id, name: p.farm_name, kind: p.farm_kind, city: p.farm_city, distance_miles: p.distance_miles } })).join('')
         : '<p class="empty">No updates yet. Farmers post them from their dashboard.</p>'}</div>`;
   }
@@ -1252,11 +1304,11 @@
   document.addEventListener('click', (e) => { const b = e.target.closest('button.linkish[data-farm]'); if (b) openFarm(Number(b.dataset.farm)); });
 
   // ---------- farm owner dashboard ----------
-  const DTABS = [['overview', 'Overview'], ['orders', 'Orders'], ['bookings', 'Bookings'], ['csa', 'CSA'], ['events', 'Events'], ['products', 'Products'],
-    ['experiences', 'Farm days'], ['updates', 'Photos and updates'], ['details', 'Listing details']];
+  const DTABS = [['overview', 'Overview'], ['orders', 'Orders'], ['groups', 'Group orders'], ['bookings', 'Bookings'], ['csa', 'CSA'], ['events', 'Events'], ['products', 'Products'],
+    ['experiences', 'Farm visits'], ['updates', 'Photos and updates'], ['details', 'Listing details']];
   async function renderFarmDashboard() {
     if (!state.user) { view.innerHTML = '<div class="wrap page"><h1>List your farm, market or stand</h1><p class="empty">Create a free farm account to get started.</p></div>'; return openAuth('register', 'Create a free account to list your farm, market or stand.', 'farmer'); }
-    if (state.user.role !== 'farmer') { view.innerHTML = '<div class="wrap page"><h1>My farm</h1><p class="empty">This account is set up for buying. To list a farm, sign out and create a farm account.</p></div>'; return; }
+    if (state.mode !== 'owner') { setMode('owner'); renderChrome(); }
     loading('My farm');
     try {
       const { farms } = await api('/my/farms');
@@ -1267,12 +1319,12 @@
           <p class="muted" style="max-width:65ch">Farms, barns, orchards, ranches, market gardens, farmers' markets, farm stands, farm-to-table restaurants and co-op groceries can all list here, anywhere in the world. It's free.</p>${farmFormCard(null)}</div>`;
         bindFarmForm(null); return;
       }
-      const [{ orders }, { bookings }, { signups }, { rsvps }, { posts }] = await Promise.all([api('/farm-orders'), api('/farm-bookings'), api('/farm-csa-signups'), api('/farm-rsvps'), api(`/farms/${farm.id}/posts`)]);
-      const n = { orders: orders.filter((o) => ['reserved', 'ready'].includes(o.status)).length, bookings: bookings.filter((b) => b.status === 'requested').length, csa: signups.filter((s) => s.status === 'requested').length };
+      const [{ orders }, { bookings }, { signups }, { rsvps }, { posts }, { groups }] = await Promise.all([api('/farm-orders'), api('/farm-bookings'), api('/farm-csa-signups'), api('/farm-rsvps'), api(`/farms/${farm.id}/posts`), api('/farm-groups')]);
+      const n = { groups: groups.filter((g) => ['open', 'confirmed'].includes(g.status)).length, orders: orders.filter((o) => ['reserved', 'ready'].includes(o.status)).length, bookings: bookings.filter((b) => b.status === 'requested').length, csa: signups.filter((s) => s.status === 'requested').length };
       const tab = DTABS.some(([k]) => k === state.dtab) ? state.dtab : 'overview';
       const body = {
         overview: () => overviewHtml(farm, n, posts, orders, bookings, signups, rsvps),
-        orders: () => incomingOrders(orders),
+        orders: () => incomingOrders(orders), groups: () => groupsCard(farm, groups),
         bookings: () => bookingsCard(bookings, farm) || '<section class="card"><h2>Booking requests</h2><p class="empty">No bookings yet. Add farm days, classes or u-pick under Farm days.</p></section>',
         csa: () => csaCard(farm, signups), events: () => eventsCard(farm, rsvps), products: () => listingsCard(farm), experiences: () => expsCard(farm),
         updates: () => postsCard(farm, posts), details: () => farmFormCard(farm),
@@ -1283,7 +1335,7 @@
         <div class="otabs" role="tablist">${DTABS.map(([k, t]) => `<button role="tab" type="button" data-dtab="${k}" aria-selected="${k === tab}">${esc(t)}${n[k] ? `<span class="n">${n[k]}</span>` : ''}</button>`).join('')}</div>
         ${body}</div>`;
       view.querySelectorAll('[data-dtab]').forEach((b) => b.addEventListener('click', () => { state.dtab = b.dataset.dtab; renderFarmDashboard(); }));
-      ({ orders: bindOrderButtons, bookings: bindBookings, csa: () => bindCsa(farm), events: () => bindEvents(farm), products: () => bindListings(farm),
+      ({ orders: bindOrderButtons, groups: () => bindGroups(farm, groups), bookings: bindBookings, csa: () => bindCsa(farm), events: () => bindEvents(farm), products: () => bindListings(farm),
         experiences: () => bindExps(farm), updates: () => bindPosts(farm, posts), details: () => bindFarmForm(farm) }[tab] || (() => {}))();
     } catch (e) { toast(e.message, true); }
   }
@@ -1292,8 +1344,9 @@
     const tile = (num, label, k, hot) => `<button type="button" class="tile${hot ? ' hot' : ''}" data-dtab="${k}"><b>${num}</b><span>${esc(label)}</span></button>`;
     const steps = [[!!farm.cover_url, 'Add a photo of your farm', 'updates'], [!!farm.description, 'Describe your farm', 'details'],
       [farm.listings.length > 0, 'List products for sale', 'products'], [(farm.csa || []).length > 0, 'Offer CSA shares (optional)', 'csa'],
-      [(farm.experiences || []).length > 0, 'Offer farm days, classes or u-pick (optional)', 'experiences'], [upcoming > 0, 'Post an event (optional)', 'events'], [posts.length > 0, 'Share a photo update', 'updates']];
-    return `<div class="tiles">${tile(n.orders, 'open orders', 'orders', n.orders)}${tile(n.bookings, 'bookings to confirm', 'bookings', n.bookings)}${tile(n.csa, 'CSA requests', 'csa', n.csa)}
+      [(farm.experiences || []).length > 0, 'Offer farm visits: riding, farm days, classes, tours or u-pick (optional)', 'experiences'],
+      [!!farm.group_orders, 'Take group orders from neighborhoods (optional)', 'groups'], [upcoming > 0, 'Post an event (optional)', 'events'], [posts.length > 0, 'Share a photo update', 'updates']];
+    return `<div class="tiles">${tile(n.orders, 'open orders', 'orders', n.orders)}${tile(n.groups, 'active group orders', 'groups')}${tile(n.bookings, 'bookings to confirm', 'bookings', n.bookings)}${tile(n.csa, 'CSA requests', 'csa', n.csa)}
       ${tile(signups.filter((s) => s.status === 'confirmed').length, 'CSA members', 'csa')}${tile(upcoming, 'upcoming events', 'events')}${tile(farm.listings.length, 'products listed', 'products')}</div>
       <section class="card"><h2>Get your listing ready</h2><ul class="steps">${steps.map(([done, label, k]) => `<li class="${done ? 'done' : ''}"><span><span class="tick" aria-hidden="true">${done ? '✓' : ''}</span>${esc(label)}</span>
         <button class="btn small ${done ? 'secondary' : ''}" type="button" data-dtab="${k}">${done ? 'Review' : 'Start'}</button></li>`).join('')}</ul></section>`;
@@ -1380,11 +1433,238 @@
     });
   }
 
+  // ---------- group orders: neighbors order together, the farm makes one delivery ----------
+  const G_STATUS = { open: 'Open for orders', confirmed: 'Confirmed by the farm', delivered: 'Delivered', cancelled: 'Cancelled' };
+  const groupBody = (f) => ({ group_orders: !!f.group_orders, group_min: (f.group_min_cents || 0) / 100, group_discount_pct: f.group_discount_pct || 0,
+    group_discount_over: (f.group_discount_over_cents || 0) / 100, group_radius_miles: f.group_radius_miles || 25 });
+  const farmBody = (f) => ({ name: f.name, kind: f.kind, description: f.description, address: f.address, city: f.city, phone: f.phone, lat: f.lat, lng: f.lng,
+    pickup_enabled: f.pickup_enabled, pickup_instructions: f.pickup_instructions, delivery_enabled: f.delivery_enabled, delivery_radius_miles: f.delivery_radius_miles,
+    delivery_fee: (f.delivery_fee_cents || 0) / 100, payment_note: f.payment_note, currency: f.currency, hours: f.hours, website: f.website,
+    accepts_snap: f.accepts_snap, wholesale: f.wholesale, ...groupBody(f) });
+  function groupTerms(f) {
+    const cur = f.currency, bits = [];
+    if (f.group_min_cents) bits.push(`The group needs at least ${money(f.group_min_cents, cur)} in orders in total`);
+    if (f.group_discount_pct) bits.push(`everyone gets ${f.group_discount_pct}% off when the group passes ${money(f.group_discount_over_cents, cur)}`);
+    if (f.group_radius_miles) bits.push(`drop-offs within ${radText(f.group_radius_miles)} of the farm`);
+    return bits.length ? esc(bits.join('; ').replace(/^./, (c) => c.toUpperCase()) + '.') : '';
+  }
+  function groupProgress(g) {
+    const cur = g.currency, t = g.total_cents, min = g.min_cents, over = g.discount_pct ? g.discount_over_cents : 0;
+    const goal = Math.max(min, over) || 0;
+    let label;
+    if (g.status === 'confirmed' || g.status === 'delivered') label = g.applied_discount_pct ? `${money(t, cur)} ordered · ${g.applied_discount_pct}% group discount applied` : `${money(t, cur)} ordered`;
+    else if (min && t < min) label = `${money(t, cur)} of the ${money(min, cur)} minimum`;
+    else if (over && t < over) label = `${money(t, cur)} ordered · ${money(over - t, cur)} more unlocks ${g.discount_pct}% off for everyone`;
+    else if (over) label = `${money(t, cur)} ordered · ${g.discount_pct}% off unlocked`;
+    else label = `${money(t, cur)} ordered${min ? ' · minimum reached' : ''}`;
+    const pct = goal ? Math.min(100, Math.round((t / goal) * 100)) : 100;
+    const minAt = goal && min && over > min ? Math.round((min / goal) * 100) : null;
+    return `<div class="gprog"><div class="bar" role="img" aria-label="${esc(label)}"><i style="width:${pct}%"></i>${minAt ? `<s style="left:${minAt}%" title="Minimum"></s>` : ''}</div><span class="meta">${esc(label)}</span></div>`;
+  }
+  function groupRow(g) {
+    return `<a class="grow" href="/group/${g.id}" data-link><div class="gtop"><div><b>${esc(g.farm_name)}</b> to <b>${esc(g.dropoff_name)}</b>
+      <div class="meta">Delivery ${niceDate(g.deliver_date)} · order by ${niceDate(g.deadline)} · ${g.households} ${g.households === 1 ? 'household' : 'households'} · hosted by ${esc(g.host_kind === 'farm' ? 'the farm' : g.host_name)}${g.distance_miles != null ? ` · ${dist(g.distance_miles)} away` : ''}</div></div>
+      <span class="status ${esc(g.status)}">${esc(g.open || g.status !== 'open' ? G_STATUS[g.status] : 'Closed')}</span></div>${groupProgress(g)}</a>`;
+  }
+
+  async function renderGroups() {
+    const where = state.place && location.pathname.split('/')[1] !== 'all' ? state.place : null;
+    loading('Group orders');
+    const qs = where ? `lat=${where.lat}&lng=${where.lng}&radius=${state.radius || 50}` : '';
+    const [{ groups }, { farms }] = await Promise.all([api('/groups?' + qs), api('/farms?type=groups&' + qs)]);
+    view.innerHTML = `<div class="wrap page"><h1>Group orders ${where ? `near ${esc(where.label)}` : ''}</h1>
+      <section class="card gexplain"><h2>Order together, get it in one delivery</h2>
+        <ol class="gsteps"><li><b>Someone starts it.</b> A farm sets up a drop-off, or a neighbor starts one for their street, office, school or church.</li>
+          <li><b>Everyone adds their own order</b> from that farm before the deadline, using the group's link.</li>
+          <li><b>The farm confirms</b> once the minimum is reached. Big groups can unlock a discount for everyone.</li>
+          <li><b>One trip, one stop.</b> The farm brings every order to the drop-off spot on delivery day. Each household pays the farm directly.</li></ol>
+        <p class="hint">Fewer trips for the farmer, fresher food and lower prices for you. Nothing is charged online.</p></section>
+      <section><h2 style="margin-bottom:.6rem">Open group orders</h2>${groups.length ? `<div class="rows">${groups.map(groupRow).join('')}</div>` : '<p class="empty">No open group orders here yet. Start one below.</p>'}</section>
+      <section><h2 style="margin-bottom:.6rem">Farms that deliver group orders</h2>${farms.length ? `<div class="rows">${farms.map((f) => `<div class="card gfarm">${thumb(f)}<div>
+          <h3><a href="/farm/${f.id}" data-link>${esc(f.name)}</a></h3><div class="meta">${badges(f)} ${esc(f.place_label || f.city)}${f.distance_miles != null ? ` · ${dist(f.distance_miles)}` : ''}</div>
+          <p class="meta">${groupTerms(f)}</p>
+          <div class="btn-group"><button class="btn small" type="button" data-start="${f.id}">Start a group order</button><a class="btn small secondary" href="/farm/${f.id}#groups" data-link>See the farm</a></div></div></div>`).join('')}</div>`
+        : '<p class="empty">No farms here take group orders yet. Farm owners can turn them on under Group orders in their dashboard.</p>'}</section></div>`;
+    view.querySelectorAll('[data-start]').forEach((b) => b.addEventListener('click', () => openStartGroup(farms.find((f) => f.id === Number(b.dataset.start)))));
+  }
+
+  // Start a group order (a neighbor) or add a drop-off (the farm itself).
+  function openStartGroup(farm, asFarm = false) {
+    if (!state.user) return openAuth('login', 'Sign in or create a free account to start a group order.');
+    const today = new Date().toLocaleDateString('en-CA');
+    const plus = (n) => new Date(Date.now() + n * 864e5).toLocaleDateString('en-CA');
+    let spot = state.place && !asFarm ? { lat: state.place.lat, lng: state.place.lng, label: state.place.label } : { lat: farm.lat, lng: farm.lng, label: farm.place_label || farm.city };
+    dlg.innerHTML = `<div class="dlg"><div class="dlg-head"><h2 id="dlgTitle">${asFarm ? 'Add a drop-off point' : `Start a group order from ${esc(farm.name)}`}</h2><button class="close" type="button" aria-label="Close" data-close>✕</button></div>
+      <form id="gForm" novalidate>
+        ${asFarm ? '' : `<p class="hint" style="margin-bottom:.7rem">${groupTerms(farm)} You'll get a link to share with neighbors. ${esc(farm.name)} gets an email and can cancel if it can't deliver.</p>`}
+        <div class="field"><label for="g-name">Drop-off spot</label><input id="g-name" type="text" placeholder="${asFarm ? 'Celina library parking lot' : 'My driveway, Maple Ct'}"></div>
+        <div class="row"><div class="field"><label for="g-addr">Street address <span class="hint">(optional)</span></label><input id="g-addr" type="text" autocomplete="street-address"></div>
+          <div class="field" style="position:relative"><label for="g-town">Town</label><input id="g-town" type="text" value="${esc(spot.label)}"></div></div>
+        <div class="row"><div class="field"><label for="g-dead">Orders close</label><input id="g-dead" type="date" min="${today}" value="${plus(5)}"></div>
+          <div class="field"><label for="g-del">Delivery day</label><input id="g-del" type="date" min="${today}" value="${plus(7)}"></div></div>
+        <div class="field"><label for="g-note">Note for the group <span class="hint">(optional)</span></label><input id="g-note" type="text" placeholder="Pickup 4 to 6pm, look for the green tent"></div>
+        <p class="error" id="gErr" role="alert"></p>
+        <div class="btn-group"><button class="btn" type="submit">${asFarm ? 'Add drop-off' : 'Start group order'}</button><button class="btn secondary" type="button" data-close>Cancel</button></div></form></div>`;
+    dlg.showModal();
+    $('#g-name', dlg).focus();
+    bindPlaceSearch($('#g-town', dlg), (p) => { spot = { lat: p.lat, lng: p.lng, label: p.label }; $('#g-town', dlg).value = p.label; });
+    $('#gForm', dlg).addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = $('#gErr', dlg); err.textContent = '';
+      let { lat, lng } = spot;
+      const addr = $('#g-addr', dlg).value.trim();
+      if (addr) { const hit = await geocode(`${addr}, ${$('#g-town', dlg).value}`); if (hit) ({ lat, lng } = hit); }
+      try {
+        const r = await api(`/farms/${farm.id}/groups`, { method: 'POST', body: { dropoff_name: $('#g-name', dlg).value, dropoff_address: addr, lat, lng,
+          deadline: $('#g-dead', dlg).value, deliver_date: $('#g-del', dlg).value, note: $('#g-note', dlg).value } });
+        dlg.close();
+        if (asFarm) { toast('Drop-off added. Buyers nearby can join it now.'); renderFarmDashboard(); }
+        else { toast('Group order started. Share the link with your neighbors.'); navigate('/group/' + r.id); }
+      } catch (ex) { err.textContent = ex.message; }
+    });
+  }
+
+  async function renderGroup(id) {
+    loading('Group order');
+    let d;
+    try { d = await api('/groups/' + id); } catch { return notFound('That group order was removed or never existed.'); }
+    const g = d.group, f = d.farm, role = d.role || null;
+    const mine = (d.orders || []).filter((o) => state.user && o.buyer_id === state.user.id);
+    const canOrder = g.open && role !== 'farm';
+    const disc = g.applied_discount_pct;
+    const orderBox = (o, showWho) => {
+      const total = o.items_total_cents, pay = disc ? Math.round(total * (1 - disc / 100)) : total;
+      return `<article class="order"><div class="item-row" style="border:0;padding:0"><div><h3>${showWho ? esc(o.buyer_name) : 'Your order'}</h3><div class="meta">${when(o.created_at)}</div></div>
+        <span class="status ${esc(o.status)}">${esc(o.status === 'ready' ? 'Confirmed' : kindLabel(o.status))}</span></div>${orderLines(o)}
+        <p><strong>${money(pay, f.currency)}</strong>${disc ? ` <span class="meta">(${money(total, f.currency)} less ${disc}% group discount)</span>` : ''}</p>
+        ${o.note ? `<p class="meta">Note: ${esc(o.note)}</p>` : ''}
+        ${!showWho && ['reserved', 'ready'].includes(o.status) && g.status === 'open' ? `<p style="margin-top:.4rem"><button class="btn small danger" data-gcancel="${o.id}">Cancel my order</button></p>` : ''}</article>`;
+    };
+    document.title = `Group order: ${f.name} to ${g.dropoff_name} | FarmDirect`;
+    view.innerHTML = `<div class="wrap page">
+      <p><a href="/farm/${f.id}" data-link>‹ ${esc(f.name)}</a></p>
+      <section class="card ghd"><div class="sec-hd" style="align-items:flex-start"><div><span class="badge">Group order</span>
+          <h1 style="margin-top:.3rem">${esc(f.name)} to ${esc(g.dropoff_name)}</h1></div>
+          <span class="status ${esc(g.status)}">${esc(g.open || g.status !== 'open' ? G_STATUS[g.status] : 'Closed to new orders')}</span></div>
+        <dl class="gfacts"><div><dt>Delivery</dt><dd>${niceDate(g.deliver_date)}</dd></div><div><dt>Orders close</dt><dd>${niceDate(g.deadline)}</dd></div>
+          <div><dt>Drop-off</dt><dd>${esc(g.dropoff_name)}${g.dropoff_address ? `, ${esc(g.dropoff_address)}` : ''}${g.place_label ? `<br><span class="meta">${esc(g.place_label)}</span>` : ''}</dd></div>
+          <div><dt>Hosted by</dt><dd>${g.host_kind === 'farm' ? esc(f.name) : `${esc(g.host_name)}, a neighbor`}</dd></div></dl>
+        ${groupProgress(g)}
+        <p class="meta" style="margin-top:.5rem">${g.households} ${g.households === 1 ? 'household has' : 'households have'} joined. ${groupTerms(f)} Each household pays ${esc(f.name)} directly: ${esc(f.payment_note)}</p>
+        ${g.note ? `<p style="margin-top:.4rem"><strong>Note:</strong> ${esc(g.note)}</p>` : ''}
+        <div class="btn-group" style="margin-top:.7rem"><button class="btn small" type="button" id="gShare">Copy link to share</button>${gmLink(gmDir(g.dropoff_address ? `${g.dropoff_address}, ${g.place_label}` : `${g.lat},${g.lng}`), 'Directions to the drop-off')}
+          ${role === 'host' && g.status === 'open' ? '<button class="btn small danger" type="button" id="gHostCancel">Cancel this group order</button>' : ''}
+          ${role === 'farm' ? '<a class="btn small secondary" href="/dashboard" data-link id="gDash">Manage in my dashboard</a>' : ''}</div></section>
+      <div class="lp-grid"><div class="page" style="gap:1.25rem">
+        ${canOrder ? `<section class="card"><h2>${mine.length ? 'Add more to your order' : 'Add your order'}</h2><div class="rows" id="g-items"></div><div id="g-cart" style="margin-top:.8rem"></div></section>`
+          : role === 'farm' ? '<div class="notice">This is your group order. Buyers add their orders here; you see the picking list in your dashboard.</div>'
+          : `<div class="notice">This group order is ${g.status === 'open' ? 'closed to new orders' : G_STATUS[g.status].toLowerCase()}. ${f.group_orders ? `<a href="/farm/${f.id}#groups" data-link>See other group orders from ${esc(f.name)}</a>.` : ''}</div>`}
+        ${(d.orders || []).length ? `<section class="card"><h2>${role === 'member' ? 'Your order' : 'Orders in this group'}</h2><div class="rows">${d.orders.map((o) => orderBox(o, role !== 'member' && o.buyer_id !== state.user.id)).join('')}</div></section>` : ''}
+      </div><aside class="lp-side"><section class="card"><h2>Where</h2><div id="gMap" class="minimap" role="region" aria-label="Map of the drop-off and the farm"></div>
+        <p class="meta" style="margin-top:.5rem">${esc(f.name)} is about ${dist(milesBetween(g.lat, g.lng, f.lat, f.lng))} from the drop-off.</p></section></aside></div></div>`;
+    const map = Maps.create($('#gMap'), g.lat, g.lng, 11); state.maps.push(map);
+    map.addPin(g.lat, g.lng, { title: g.dropoff_name, kind: 'other' }); map.addPin(f.lat, f.lng, { title: f.name, kind: f.kind });
+    map.fit([[g.lat, g.lng], [f.lat, f.lng]]);
+    $('#gShare').addEventListener('click', async () => { try { await navigator.clipboard.writeText(location.origin + '/group/' + g.id); toast('Link copied. Send it to your neighbors.'); } catch { toast('Copy this link: ' + location.origin + '/group/' + g.id); } });
+    $('#gDash')?.addEventListener('click', () => { state.dtab = 'groups'; });
+    $('#gHostCancel')?.addEventListener('click', async () => {
+      if (!confirm('Cancel this group order? Everyone who joined is told and their items go back on sale.')) return;
+      try { await api(`/groups/${g.id}/status`, { method: 'POST', body: { status: 'cancelled' } }); toast('Group order cancelled.'); renderGroup(g.id); } catch (e) { toast(e.message, true); }
+    });
+    view.querySelectorAll('[data-gcancel]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Cancel your order in this group?')) return;
+      try { await api(`/orders/${b.dataset.gcancel}/status`, { method: 'PATCH', body: { status: 'cancelled' } }); toast('Order cancelled.'); renderGroup(g.id); } catch (e) { toast(e.message, true); }
+    }));
+    if (canOrder) drawGroupItems(g, f, d.listings, {});
+  }
+  function drawGroupItems(g, f, listings, lines) {
+    $('#g-items').innerHTML = listings.length ? listings.map((l) => `<div class="item"><div><strong>${esc(l.name)}</strong> <span class="badge">${esc(catName(l.category))}</span>
+        <div class="meta">${[harvestLabel(l.harvest_date), `${qtyText(l.qty_available)} ${esc(l.unit)} left`].filter(Boolean).join(', ')}</div></div>
+      <div class="buy"><span class="price">${money(l.price_cents, f.currency)}/${esc(l.unit)}</span><label class="sr" for="gq-${l.id}">Quantity of ${esc(l.name)}</label>
+        <input id="gq-${l.id}" type="number" min="${stepFor(l.unit)}" step="${stepFor(l.unit)}" value="1" inputmode="decimal"><button class="btn small" type="button" data-gadd="${l.id}">Add</button></div></div>`).join('')
+      : '<p class="empty">Nothing is for sale right now. Check back before the deadline.</p>';
+    const drawCartBox = () => {
+      const ls = Object.values(lines), sum = ls.reduce((s, x) => s + Math.round(x.l.price_cents * x.qty), 0), box = $('#g-cart');
+      if (!ls.length) { box.innerHTML = ''; return; }
+      box.innerHTML = `<form class="cart" id="gCheckout" novalidate><h3>Your part of the group order</h3><table>${ls.map((x) => `<tr><td>${esc(x.l.name)}, ${qtyText(x.qty)} ${esc(x.l.unit)}</td>
+        <td class="r">${money(Math.round(x.l.price_cents * x.qty), f.currency)} <button class="btn small danger" type="button" data-grm="${x.l.id}" aria-label="Remove ${esc(x.l.name)}">Remove</button></td></tr>`).join('')}
+        <tr class="total"><td>Your total${g.discount_pct ? ` (before any group discount)` : ''}</td><td class="r">${money(sum, f.currency)}</td></tr></table>
+        <div class="field"><label for="g-onote">Note for the farm <span class="hint">(optional)</span></label><input id="g-onote" type="text" placeholder="Apartment 4B, I'll pick up after 5"></div>
+        <p class="error" id="gcErr" role="alert"></p>
+        <div class="btn-group"><button class="btn" type="submit">Join the group order</button><span class="hint">Delivered to ${esc(g.dropoff_name)} on ${niceDate(g.deliver_date)}. Pay ${esc(f.name)} at the drop-off.</span></div></form>`;
+      box.querySelectorAll('[data-grm]').forEach((b) => b.addEventListener('click', () => { delete lines[b.dataset.grm]; drawCartBox(); }));
+      $('#gCheckout').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (!state.user) return openAuth('login', 'Sign in or create a free account to join this group order.');
+        try {
+          await api('/orders', { method: 'POST', body: { farm_id: f.id, group_id: g.id, items: ls.map((x) => ({ listing_id: x.l.id, qty: x.qty })), note: $('#g-onote').value } });
+          toast("You're in. We'll email you when the farm confirms."); renderGroup(g.id);
+        } catch (ex) { $('#gcErr').textContent = ex.message; }
+      });
+    };
+    view.querySelectorAll('[data-gadd]').forEach((b) => b.addEventListener('click', () => {
+      const l = listings.find((x) => x.id === Number(b.dataset.gadd)), qty = Number($('#gq-' + l.id).value), had = lines[l.id]?.qty || 0;
+      if (!(qty > 0)) return toast('Enter how much you want.', true);
+      if (had + qty > l.qty_available) return toast(`Only ${qtyText(l.qty_available)} ${l.unit} available.`, true);
+      lines[l.id] = { l, qty: had + qty }; drawCartBox(); toast(`Added ${qtyText(qty)} ${l.unit} of ${l.name}.`);
+    }));
+    drawCartBox();
+  }
+
+  // Group orders (owner dashboard)
+  function groupsCard(farm, groups) {
+    const cur = farm.currency;
+    const card = (g) => {
+      const live = ['open', 'confirmed'].includes(g.status);
+      return `<article class="order"><div class="item-row" style="border:0;padding:0"><div><h3>${esc(g.dropoff_name)}</h3>
+        <div class="meta">Delivery ${niceDate(g.deliver_date)} · orders close ${niceDate(g.deadline)} · ${g.host_kind === 'farm' ? 'your drop-off' : `started by ${esc(g.host_name)}, a neighbor`} · ${g.households} ${g.households === 1 ? 'household' : 'households'}</div></div>
+        <span class="status ${esc(g.status)}">${esc(G_STATUS[g.status])}</span></div>
+        ${groupProgress(g)}
+        ${g.orders.length ? `<details><summary>Picking list: ${g.picking.length} ${g.picking.length === 1 ? 'item' : 'items'}</summary><table class="pick">${g.picking.map((p) => `<tr><td>${esc(p.name)}</td><td class="r tnum">${qtyText(p.qty)} ${esc(p.unit)}</td></tr>`).join('')}</table></details>
+        <details><summary>By household</summary>${g.orders.map((o) => `<div class="hh"><strong>${esc(o.buyer_name)}</strong> <span class="meta">${esc(o.buyer_email)}${o.note ? ` · ${esc(o.note)}` : ''}</span>
+          <div class="meta">${o.items.map((i) => `${esc(i.name)} ${qtyText(i.qty)} ${esc(i.unit)}`).join(', ')} · ${money(o.items_total_cents, cur)}${g.applied_discount_pct ? `, pays ${money(Math.round(o.items_total_cents * (1 - g.applied_discount_pct / 100)), cur)}` : ''}</div></div>`).join('')}</details>` : '<p class="meta">No orders yet. Share the link: <a href="/group/' + g.id + '" data-link>/group/' + g.id + '</a></p>'}
+        <div class="btn-group" style="margin-top:.5rem"><a class="btn small secondary" href="/group/${g.id}" data-link>Open group page</a>${gmLink(gmDir(g.dropoff_address ? `${g.dropoff_address}, ${g.place_label}` : `${g.lat},${g.lng}`), 'Directions')}
+          ${g.status === 'open' ? `<button class="btn small" data-gst="confirmed" data-g="${g.id}">Confirm and close orders</button>` : ''}
+          ${g.status === 'confirmed' ? `<button class="btn small" data-gst="delivered" data-g="${g.id}">Mark delivered</button>` : ''}
+          ${live ? `<button class="btn small danger" data-gst="cancelled" data-g="${g.id}">Cancel</button>` : ''}</div></article>`;
+    };
+    const active = groups.filter((g) => ['open', 'confirmed'].includes(g.status)), past = groups.filter((g) => !['open', 'confirmed'].includes(g.status));
+    return `<section class="card"><h2>Group orders</h2>
+      <p class="hint" style="margin-bottom:.7rem">A street, office or school orders together by a deadline; you make one trip to one drop-off spot. You can add your own drop-offs, or let neighbors start them.</p>
+      <form id="grpSet" novalidate>
+        <label class="check"><input type="checkbox" id="gs-on" ${farm.group_orders ? 'checked' : ''}> Let neighbors start group orders for my farm</label>
+        <div class="row"><div class="field"><label for="gs-min">Minimum per group (${esc(cur)}) <span class="hint">0 for none</span></label><input id="gs-min" type="number" min="0" step="1" value="${(farm.group_min_cents || 0) / 100}"></div>
+          <div class="field"><label for="gs-pct">Bulk discount (%)</label><input id="gs-pct" type="number" min="0" max="50" step="1" value="${farm.group_discount_pct || 0}"></div>
+          <div class="field"><label for="gs-over">when the group passes (${esc(cur)})</label><input id="gs-over" type="number" min="0" step="1" value="${(farm.group_discount_over_cents || 0) / 100}"></div>
+          <div class="field"><label for="gs-rad">Deliver within (${uLong()})</label><input id="gs-rad" type="number" min="1" step="1" value="${Math.round(toU(farm.group_radius_miles || 25))}"></div></div>
+        <p class="error" id="gsErr" role="alert"></p>
+        <div class="btn-group"><button class="btn" type="submit">Save settings</button><button class="btn secondary" type="button" id="gNew">Add a drop-off point</button></div></form></section>
+      <section class="card"><h2>Active</h2>${active.length ? `<div class="rows">${active.map(card).join('')}</div>` : '<p class="empty">No active group orders. Add a drop-off point, or turn on neighbor group orders above.</p>'}</section>
+      ${past.length ? `<section class="card"><h2>Past</h2><div class="rows">${past.map(card).join('')}</div></section>` : ''}`;
+  }
+  function bindGroups(farm) {
+    $('#gNew').addEventListener('click', () => openStartGroup(farm, true));
+    $('#grpSet').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = { ...farmBody(farm), group_orders: $('#gs-on').checked, group_min: $('#gs-min').value || 0, group_discount_pct: $('#gs-pct').value || 0,
+        group_discount_over: $('#gs-over').value || 0, group_radius_miles: fromU(Number($('#gs-rad').value) || 25) };
+      try { await api('/farms/' + farm.id, { method: 'PUT', body }); toast('Group order settings saved.'); renderFarmDashboard(); } catch (ex) { $('#gsErr').textContent = ex.message; }
+    });
+    view.querySelectorAll('[data-gst]').forEach((b) => b.addEventListener('click', async () => {
+      const st = b.dataset.gst;
+      const ask = { confirmed: 'Confirm this group order? It closes to new orders, and everyone gets an email that it is coming. Any bulk discount is locked in now.',
+        delivered: 'Mark every order in this group delivered?', cancelled: 'Cancel this group order? Everyone is told and the produce goes back on sale.' }[st];
+      if (!confirm(ask)) return;
+      try { await api(`/groups/${b.dataset.g}/status`, { method: 'POST', body: { status: st } }); toast({ confirmed: 'Confirmed. Buyers were told.', delivered: 'Marked delivered.', cancelled: 'Group order cancelled.' }[st]); renderFarmDashboard(); }
+      catch (ex) { toast(ex.message, true); }
+    }));
+  }
+
   // ---------- boot ----------
   async function boot() {
     await Maps.init();
     if (state.token) { try { state.user = (await api('/me')).user; } catch { state.token = null; } }
-    if (state.user?.role === 'farmer') { try { const { farms } = await api('/my/farms'); state.mine = farms[0]?.id || null; } catch { /* ignore */ } }
+    if (state.user) { try { const { farms } = await api('/my/farms'); state.mine = farms[0]?.id || null; } catch { /* ignore */ } }
     route();
   }
   boot();

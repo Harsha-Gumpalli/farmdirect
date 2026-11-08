@@ -7,8 +7,29 @@ A farm-to-buyer marketplace that works anywhere in the world. Farmers post what 
 - **Town pages** like `/celina-tx` or `/hyderabad-in` for any of ~24,600 towns: featured farms, farmers' markets, local products by category, what's in season, a photo gallery, upcoming events, CSA shares and farm days, plus a map.
 - **Directory** with a type filter (farms, farmers' markets, u-pick, farm stands, CSA, farm days, wholesale, restaurants, groceries, accepts SNAP), product filter, search and distance, as a list and a map. Addresses like `/celina-tx/markets` or `/celina-tx/products/eggs`.
 - **Listing pages** (`/farm/12`) with about, products to reserve, CSA sign-up, farm days to book, events to RSVP, photo updates, map, hours, directions and SNAP/wholesale badges.
-- **For buyers:** My orders shows produce orders, CSA memberships, bookings and events.
-- **For farms, markets and stands:** a dashboard with tabs for orders, bookings, CSA members and shares, events and RSVPs, products, farm days, photos and updates, and listing details.
+- **Farm visits** (`/celina-tx/experiences/horse`, `/day`, `/learn`, `/tour`, `/pick`): horseback riding, spending a day on a farm, farming classes, farm and barn tours and u-pick, plus a **Barns and ranches** section with their produce.
+- **Group orders** (`/celina-tx/group-orders`, `/group/12`): neighbors pool orders so a farm makes one delivery to one drop-off spot (see below).
+- **One account does both.** A **Visitor / Farm owner** switch in the header moves between buying (My orders) and running a listing (the dashboard). A **mi / km** switch changes every distance on the site.
+- **For buyers:** My orders shows produce and group orders, group orders you host, CSA memberships, farm visit bookings and events.
+- **For farms, markets and stands:** a dashboard with tabs for orders, group orders, bookings, CSA members and shares, events and RSVPs, products, farm visits, photos and updates, and listing details.
+
+## Group orders
+
+Everyone on a street, at an office or a school orders from one farm by a deadline, and the farm brings it all in one trip.
+
+- **Two ways to start one.** The farm adds its own drop-off points (a library lot, a church), or, if the farm allows it, any neighbor starts one for their street within the farm's delivery radius.
+- **The farm sets the terms:** a minimum per group, an optional bulk discount (for example 10% off once the group passes $300) and how far it will deliver.
+- Each household adds its own order through the group's link. Stock is held right away.
+- The farm sees a **picking list** (everything added up) and a **per-household breakdown**, then **confirms** (orders close, the discount is locked in and everyone is emailed), **marks it delivered**, or **cancels** (stock goes back on sale). A neighbor host can cancel before the farm confirms.
+- Each household still pays the farm directly at the drop-off.
+
+## Email notifications
+
+With `RESEND_API_KEY` set, the app emails farms about new orders, group orders, booking requests, CSA sign-ups and RSVPs, and emails buyers when their order is ready, a booking or CSA spot is confirmed or declined, or a group order is confirmed, delivered or cancelled. Without a key it only logs what it would send.
+
+1. Sign up at [resend.com](https://resend.com) and create an API key.
+2. Verify your domain there so mail comes from your own address.
+3. Set `RESEND_API_KEY`, `EMAIL_FROM` (for example `FarmDirect <hello@yourdomain.com>`) and `SITE_URL` (your site's address, used for links in emails).
 
 ## Run it
 
@@ -139,6 +160,7 @@ Environment variables:
 - `DB_PATH`, `UPLOAD_DIR`: default to `/data/farmdirect.db` and `/data/uploads` in the Docker image.
 - `GOOGLE_MAPS_API_KEY`: optional, turns on Google Maps.
 - `MAX_UPLOAD_MB`: largest photo or video allowed, default 50.
+- `RESEND_API_KEY`, `EMAIL_FROM`, `SITE_URL`: turn on email notifications.
 - `SEED_DEMO`: `true` adds six example farms on first start so the site isn't empty; set `false` for a real launch.
 
 `/healthz` answers `{"ok":true}` for uptime checks. The app always runs one copy (SQLite); move to Postgres before running several.
@@ -147,9 +169,9 @@ Environment variables:
 
 - A farmer account manages one farm in the UI (the API supports several).
 - Delivery radius is only enforced when the buyer shared their location; otherwise the farmer confirms the address.
-- No email or SMS notifications yet, so farmers check the dashboard. Adding email through Resend or Twilio SMS is the highest-value next step.
+- No SMS notifications; email needs a Resend key (see above).
 - No password reset, email verification or rate limiting yet.
 - Videos are stored as uploaded. For many large videos, move uploads to a storage service such as S3 or Cloudflare R2.
 - Farm addresses are shown publicly. Farmers who use a home address may prefer to enter only a town and a pickup note; the pin is exact, so ask them to place it near, not on, their house if they want privacy.
-- Distances are in miles; the delivery radius a farmer enters is in miles too.
+- Distances are stored in miles and shown in miles or kilometres.
 - Seeding real farms: start where you are. In the US, the USDA Local Food Directory and LocalHarvest list farms you can invite directly.

@@ -2,12 +2,16 @@ const express = require('express');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
-const { db, seed, seedExtras, setPlace, KINDS, CATEGORIES } = require('./db');
+const { db, seed, seedExtras, seedGroups, setPlace, KINDS, CATEGORIES } = require('./db');
+const { notify, emailEnabled } = require('./notify');
 const cities = require('./cities');
 const { hashPassword, verifyPassword, signToken, authenticate, requireAuth } = require('./auth');
 
 // Demo farms help people try the app. Set SEED_DEMO=false for a real launch with no example data.
-if (process.env.SEED_DEMO !== 'false') { seed(); seedExtras(); }
+if (process.env.SEED_DEMO !== 'false') { seed(); seedExtras(); seedGroups(); }
+const userEmail = (id) => db.prepare('SELECT email FROM users WHERE id = ?').get(id)?.email;
+const ownerEmail = (farmId) => db.prepare('SELECT u.email FROM farms f JOIN users u ON u.id = f.owner_id WHERE f.id = ?').get(farmId)?.email;
+const userName = (id) => db.prepare('SELECT name FROM users WHERE id = ?').get(id)?.name || 'Someone';
 if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
   console.warn('SESSION_SECRET is not set: everyone will be signed out whenever the server restarts.');
 }
@@ -109,8 +113,14 @@ function publicFarm(f) {
     hours: f.hours || '',
     place_slug: f.place_slug || '',
     place_label: f.place_label || f.city || '',
+    group_orders: !!f.group_orders,
+    group_min_cents: f.group_min_cents || 0,
+    group_discount_pct: f.group_discount_pct || 0,
+    group_discount_over_cents: f.group_discount_over_cents || 0,
+    group_radius_miles: f.group_radius_miles || 0,
   };
 }
+const ownFarmGuard = (farm, userId) => { if (farm.owner_id === userId) throw fail(400, 'This is your own farm. Use another account to buy from it.'); };
 
 function ownedFarm(farmId, userId) {
   const farm = db.prepare('SELECT * FROM farms WHERE id = ?').get(farmId);
@@ -190,6 +200,13 @@ const TYPE_TEST = {
   experiences: (f) => f.experiences.length > 0,
   events: (f) => f.event_count > 0,
   snap: (f) => f.accepts_snap,
+  barns: (f) => f.kind === 'barn' || f.kind === 'ranch',
+  groups: (f) => f.group_orders,
+  'exp:day': (f) => f.experiences.some((e) => e.type === 'day'),
+  'exp:learn': (f) => f.experiences.some((e) => e.type === 'learn'),
+  'exp:horse': (f) => f.experiences.some((e) => e.type === 'horse'),
+  'exp:tour': (f) => f.experiences.some((e) => e.type === 'tour'),
+  'exp:pick': (f) => f.experiences.some((e) => e.type === 'pick'),
 };
 const today = () => new Date(Date.now() - 6 * 3600e3).toISOString().slice(0, 10); // a little behind UTC so US evenings still count as today
 const csaCount = db.prepare('SELECT COUNT(*) AS n FROM csa_shares WHERE farm_id = ? AND active = 1 AND removed = 0');
@@ -279,6 +296,9 @@ app.get('/api/local', wrap((req, res) => {
   const all = directory({ lat, lng, radius });
   const counts = Object.fromEntries(Object.keys(TYPE_TEST).map((k) => [k, all.filter(TYPE_TEST[k]).length]));
   counts.all = all.length;
+  for (const t of Object.keys(EXP_TYPES)) counts['exp_' + t] = all.filter((f) => f.experiences.some((e) => e.type === t)).length;
+  counts.barns = all.filter((f) => f.kind === 'barn' || f.kind === 'ranch').length;
+  counts.groups = openGroups({ lat, lng, radius }).length;
   const ids = new Set(all.map((f) => f.id));
   const card = (f) => ({ id: f.id, name: f.name, kind: f.kind, place_label: f.place_label, distance_miles: f.distance_miles, cover_url: f.cover_url,
     description: f.description, hours: f.hours, item_count: f.items.length, csa_count: f.csa_count, event_count: f.event_count, accepts_snap: f.accepts_snap });
@@ -292,12 +312,12 @@ app.get('/api/local', wrap((req, res) => {
   const season = seasonFor(lat);
   const events = db.prepare('SELECT * FROM events WHERE removed = 0 AND date >= ? ORDER BY date, start_time').all(today())
     .filter((e) => ids.has(e.farm_id)).slice(0, 8).map((e) => ({ ...publicEvent(e), farm_name: all.find((f) => f.id === e.farm_id).name }));
-  const experiences = all.flatMap((f) => f.experiences.map((e) => ({ ...e, farm_name: f.name, currency: f.currency, distance_miles: f.distance_miles }))).slice(0, 8);
+  const experiences = all.flatMap((f) => f.experiences.map((e) => ({ ...e, farm_name: f.name, farm_kind: f.kind, currency: f.currency, distance_miles: f.distance_miles }))).slice(0, 12);
   const csa = db.prepare('SELECT * FROM csa_shares WHERE active = 1 AND removed = 0').all().filter((c) => ids.has(c.farm_id))
     .map((c) => { const f = all.find((x) => x.id === c.farm_id); return { ...publicShare(c), farm_name: f.name, currency: f.currency, distance_miles: f.distance_miles }; })
     .sort((a, b) => a.distance_miles - b.distance_miles).slice(0, 6);
   res.json({
-    counts, featured, markets, events, experiences, csa,
+    counts, featured, markets, events, experiences, csa, groups: openGroups({ lat, lng, radius }).slice(0, 6),
     products: Object.entries(products).sort((a, b) => b[1] - a[1]).map(([category, farms]) => ({ category, farms })),
     gallery: gallery(ids, 12),
     in_season: { season, nearby: Object.values(nearbyItems).sort((a, b) => b.farms - a.farms).slice(0, 16), typical: SEASONAL[season] },
@@ -320,6 +340,10 @@ app.get('/api/gallery', wrap((req, res) => {
 }));
 
 // ---------- farmer: farms ----------
+function saveGroupSettings(id, f) {
+  db.prepare('UPDATE farms SET group_orders=?, group_min_cents=?, group_discount_pct=?, group_discount_over_cents=?, group_radius_miles=? WHERE id=?')
+    .run(f.group_orders, f.group_min_cents, f.group_discount_pct, f.group_discount_over_cents, f.group_radius_miles, id);
+}
 function farmFromBody(b) {
   const name = str(b.name, 120);
   const lat = num(b.lat);
@@ -356,10 +380,15 @@ function farmFromBody(b) {
     wholesale: b.wholesale ? 1 : 0,
     website,
     hours: str(b.hours, 120),
+    group_orders: b.group_orders ? 1 : 0,
+    group_min_cents: Math.max(0, Math.round((num(b.group_min) || 0) * 100)),
+    group_discount_pct: Math.min(50, Math.max(0, Math.round(num(b.group_discount_pct) || 0))),
+    group_discount_over_cents: Math.max(0, Math.round((num(b.group_discount_over) || 0) * 100)),
+    group_radius_miles: Math.max(0, num(b.group_radius_miles) || 25),
   };
 }
 
-app.get('/api/my/farms', requireAuth('farmer'), wrap((req, res) => {
+app.get('/api/my/farms', requireAuth(), wrap((req, res) => {
   const farms = db.prepare('SELECT * FROM farms WHERE owner_id = ? ORDER BY id').all(req.user.id);
   const stmt = db.prepare('SELECT * FROM listings WHERE farm_id = ? AND active = 1 ORDER BY name');
   const exps = db.prepare('SELECT * FROM experiences WHERE farm_id = ? AND removed = 0 ORDER BY id');
@@ -369,7 +398,7 @@ app.get('/api/my/farms', requireAuth('farmer'), wrap((req, res) => {
     csa: shares.all(f.id).map(publicShare), events: evs.all(f.id).map(publicEvent) })) });
 }));
 
-app.post('/api/farms', requireAuth('farmer'), wrap((req, res) => {
+app.post('/api/farms', requireAuth(), wrap((req, res) => {
   const f = farmFromBody(req.body);
   const r = db
     .prepare(`INSERT INTO farms (owner_id,name,kind,description,address,city,lat,lng,phone,
@@ -379,10 +408,11 @@ app.post('/api/farms', requireAuth('farmer'), wrap((req, res) => {
       f.pickup_enabled, f.pickup_instructions, f.delivery_enabled, f.delivery_radius_miles,
       f.delivery_fee_cents, f.payment_note, f.currency, f.accepts_snap, f.wholesale, f.website, f.hours);
   setPlace(Number(r.lastInsertRowid));
+  saveGroupSettings(Number(r.lastInsertRowid), f);
   res.status(201).json({ id: Number(r.lastInsertRowid) });
 }));
 
-app.put('/api/farms/:id', requireAuth('farmer'), wrap((req, res) => {
+app.put('/api/farms/:id', requireAuth(), wrap((req, res) => {
   ownedFarm(req.params.id, req.user.id);
   const f = farmFromBody(req.body);
   db.prepare(`UPDATE farms SET name=?,kind=?,description=?,address=?,city=?,lat=?,lng=?,phone=?,
@@ -392,6 +422,7 @@ app.put('/api/farms/:id', requireAuth('farmer'), wrap((req, res) => {
       f.pickup_enabled, f.pickup_instructions, f.delivery_enabled, f.delivery_radius_miles,
       f.delivery_fee_cents, f.payment_note, f.currency, f.accepts_snap, f.wholesale, f.website, f.hours, req.params.id);
   setPlace(Number(req.params.id));
+  saveGroupSettings(Number(req.params.id), f);
   res.json({ ok: true });
 }));
 
@@ -416,7 +447,7 @@ function listingFromBody(b) {
   };
 }
 
-app.post('/api/farms/:id/listings', requireAuth('farmer'), wrap((req, res) => {
+app.post('/api/farms/:id/listings', requireAuth(), wrap((req, res) => {
   ownedFarm(req.params.id, req.user.id);
   const l = listingFromBody(req.body);
   const r = db
@@ -435,7 +466,7 @@ function ownedListing(id, userId) {
   return row;
 }
 
-app.put('/api/listings/:id', requireAuth('farmer'), wrap((req, res) => {
+app.put('/api/listings/:id', requireAuth(), wrap((req, res) => {
   ownedListing(req.params.id, req.user.id);
   const l = listingFromBody(req.body);
   db.prepare(`UPDATE listings SET name=?,category=?,unit=?,price_cents=?,qty_available=?,description=?,harvest_date=? WHERE id=?`)
@@ -443,7 +474,7 @@ app.put('/api/listings/:id', requireAuth('farmer'), wrap((req, res) => {
   res.json({ ok: true });
 }));
 
-app.delete('/api/listings/:id', requireAuth('farmer'), wrap((req, res) => {
+app.delete('/api/listings/:id', requireAuth(), wrap((req, res) => {
   ownedListing(req.params.id, req.user.id);
   db.prepare('UPDATE listings SET active = 0 WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
@@ -457,7 +488,7 @@ function publicPost(p) {
 }
 
 // Upload one photo or video. Send the raw file as the request body with its Content-Type.
-app.post('/api/uploads', requireAuth('farmer'),
+app.post('/api/uploads', requireAuth(),
   express.raw({ type: Object.keys(MEDIA_TYPES), limit: `${MAX_UPLOAD_MB}mb` }),
   wrap((req, res) => {
     const type = String(req.headers['content-type'] || '').split(';')[0].trim();
@@ -481,7 +512,7 @@ function cleanMedia(list) {
   });
 }
 
-app.post('/api/farms/:id/posts', requireAuth('farmer'), wrap((req, res) => {
+app.post('/api/farms/:id/posts', requireAuth(), wrap((req, res) => {
   ownedFarm(req.params.id, req.user.id);
   const body = str(req.body.body, 2000);
   const media = cleanMedia(req.body.media);
@@ -495,7 +526,7 @@ app.get('/api/farms/:id/posts', wrap((req, res) => {
   res.json({ posts: rows.map(publicPost) });
 }));
 
-app.delete('/api/posts/:id', requireAuth('farmer'), wrap((req, res) => {
+app.delete('/api/posts/:id', requireAuth(), wrap((req, res) => {
   const post = db.prepare('SELECT p.*, f.owner_id FROM posts p JOIN farms f ON f.id = p.farm_id WHERE p.id = ?').get(req.params.id);
   if (!post) throw fail(404, 'Update not found.');
   if (post.owner_id !== req.user.id) throw fail(403, 'That is not your update.');
@@ -504,7 +535,7 @@ app.delete('/api/posts/:id', requireAuth('farmer'), wrap((req, res) => {
   res.json({ ok: true });
 }));
 
-app.put('/api/farms/:id/cover', requireAuth('farmer'), wrap((req, res) => {
+app.put('/api/farms/:id/cover', requireAuth(), wrap((req, res) => {
   const farm = ownedFarm(req.params.id, req.user.id);
   const url = req.body.url ? cleanMedia([{ url: req.body.url }])[0].url : '';
   if (url && !/\.(jpg|png|webp|gif)$/.test(url)) throw fail(400, 'The farm photo must be a photo, not a video.');
@@ -546,26 +577,26 @@ function ownedExp(id, userId) {
   if (row.owner_id !== userId) throw fail(403, 'That is not your experience.');
   return row;
 }
-app.post('/api/farms/:id/experiences', requireAuth('farmer'), wrap((req, res) => {
+app.post('/api/farms/:id/experiences', requireAuth(), wrap((req, res) => {
   ownedFarm(req.params.id, req.user.id);
   const e = expFromBody(req.body);
   const r = db.prepare(`INSERT INTO experiences (farm_id,type,title,about,price_cents,per,duration,max_people,schedule,min_age,bring)
     VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(req.params.id, e.type, e.title, e.about, e.price_cents, e.per, e.duration, e.max_people, e.schedule, e.min_age, e.bring);
   res.status(201).json({ id: Number(r.lastInsertRowid) });
 }));
-app.put('/api/experiences/:id', requireAuth('farmer'), wrap((req, res) => {
+app.put('/api/experiences/:id', requireAuth(), wrap((req, res) => {
   ownedExp(req.params.id, req.user.id);
   const e = expFromBody(req.body);
   db.prepare(`UPDATE experiences SET type=?,title=?,about=?,price_cents=?,per=?,duration=?,max_people=?,schedule=?,min_age=?,bring=? WHERE id=?`)
     .run(e.type, e.title, e.about, e.price_cents, e.per, e.duration, e.max_people, e.schedule, e.min_age, e.bring, req.params.id);
   res.json({ ok: true });
 }));
-app.patch('/api/experiences/:id/active', requireAuth('farmer'), wrap((req, res) => {
+app.patch('/api/experiences/:id/active', requireAuth(), wrap((req, res) => {
   ownedExp(req.params.id, req.user.id);
   db.prepare('UPDATE experiences SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, req.params.id);
   res.json({ ok: true });
 }));
-app.delete('/api/experiences/:id', requireAuth('farmer'), wrap((req, res) => {
+app.delete('/api/experiences/:id', requireAuth(), wrap((req, res) => {
   ownedExp(req.params.id, req.user.id);
   db.prepare('UPDATE experiences SET removed = 1, active = 0 WHERE id = ?').run(req.params.id); // bookings keep their history
   res.json({ ok: true });
@@ -573,9 +604,10 @@ app.delete('/api/experiences/:id', requireAuth('farmer'), wrap((req, res) => {
 
 // ---------- farm experiences: bookings ----------
 // A booking is a request; the farmer confirms or declines it. Payment happens directly between guest and farmer.
-app.post('/api/bookings', requireAuth('buyer'), wrap((req, res) => {
+app.post('/api/bookings', requireAuth(), wrap((req, res) => {
   const exp = db.prepare('SELECT * FROM experiences WHERE id = ? AND active = 1 AND removed = 0').get(Number(req.body.experience_id));
   if (!exp) throw fail(404, 'This experience is no longer offered.');
+  ownFarmGuard(db.prepare('SELECT owner_id FROM farms WHERE id = ?').get(exp.farm_id), req.user.id);
   const date = str(req.body.date, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw fail(400, 'Pick a date.');
   const today = new Date(Date.now() - 36 * 3600e3).toISOString().slice(0, 10); // allow for time zones
@@ -594,19 +626,20 @@ app.post('/api/bookings', requireAuth('buyer'), wrap((req, res) => {
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(req.user.id, exp.id, exp.farm_id, date, people, contact, str(req.body.note, 500), exp.title, exp.price_cents, exp.per, total);
     db.exec('COMMIT');
     const farm = db.prepare('SELECT payment_note, currency FROM farms WHERE id = ?').get(exp.farm_id);
+    notify(ownerEmail(exp.farm_id), `Booking request: ${exp.title} on ${date}`, [`${userName(req.user.id)} asked to book ${exp.title} for ${people} on ${date}.`, `Contact: ${contact}`, 'Confirm or decline it under Bookings in your dashboard.'], '/dashboard');
     res.status(201).json({ id: Number(r.lastInsertRowid), total_cents: total, per: exp.per, currency: farm.currency, payment_note: farm.payment_note });
   } catch (e) {
     db.exec('ROLLBACK');
     throw e;
   }
 }));
-app.get('/api/bookings/mine', requireAuth('buyer'), wrap((req, res) => {
+app.get('/api/bookings/mine', requireAuth(), wrap((req, res) => {
   const rows = db.prepare(`SELECT b.*, f.name AS farm_name, f.address AS farm_address, f.city AS farm_city, f.lat AS farm_lat, f.lng AS farm_lng,
       f.phone AS farm_phone, f.payment_note, f.currency
     FROM bookings b JOIN farms f ON f.id = b.farm_id WHERE b.buyer_id = ? ORDER BY b.date DESC, b.id DESC`).all(req.user.id);
   res.json({ bookings: rows });
 }));
-app.get('/api/farm-bookings', requireAuth('farmer'), wrap((req, res) => {
+app.get('/api/farm-bookings', requireAuth(), wrap((req, res) => {
   const rows = db.prepare(`SELECT b.*, f.currency, u.name AS buyer_name, u.email AS buyer_email
     FROM bookings b JOIN farms f ON f.id = b.farm_id JOIN users u ON u.id = b.buyer_id
     WHERE f.owner_id = ? ORDER BY b.date ASC, b.id ASC`).all(req.user.id);
@@ -616,14 +649,18 @@ app.patch('/api/bookings/:id/status', requireAuth(), wrap((req, res) => {
   const status = req.body.status;
   const b = db.prepare('SELECT b.*, f.owner_id FROM bookings b JOIN farms f ON f.id = b.farm_id WHERE b.id = ?').get(req.params.id);
   if (!b) throw fail(404, 'Booking not found.');
-  const isFarmer = req.user.role === 'farmer' && b.owner_id === req.user.id;
-  const isGuest = req.user.role === 'buyer' && b.buyer_id === req.user.id;
+  const isFarmer = b.owner_id === req.user.id;
+  const isGuest = !isFarmer && b.buyer_id === req.user.id;
   if (!isFarmer && !isGuest) throw fail(403, 'Not your booking.');
   const allowed = isFarmer
     ? { requested: ['confirmed', 'declined'], confirmed: ['done', 'declined'] }
     : { requested: ['cancelled'], confirmed: ['cancelled'] };
   if (!(allowed[b.status] || []).includes(status)) throw fail(400, `This booking is ${b.status} and can't be changed to ${status}.`);
   db.prepare('UPDATE bookings SET status = ? WHERE id = ?').run(status, b.id);
+  const bf = db.prepare('SELECT name FROM farms WHERE id = ?').get(b.farm_id).name;
+  if (isFarmer && status !== 'done') notify(userEmail(b.buyer_id), status === 'confirmed' ? `${bf} confirmed your ${b.title} on ${b.date}` : `${bf} can't host ${b.title} on ${b.date}`,
+    [status === 'confirmed' ? `You're booked for ${b.title} on ${b.date} for ${b.people}. Pay the farm directly when you arrive.` : 'Your booking request was declined. Try another date.'], '/orders');
+  if (isGuest) notify(ownerEmail(b.farm_id), `${userName(b.buyer_id)} cancelled ${b.title} on ${b.date}`, ['The spots are open again.'], '/dashboard');
   res.json({ ok: true });
 }));
 
@@ -645,26 +682,27 @@ function ownedShare(id, userId) {
   const row = db.prepare('SELECT c.*, f.owner_id FROM csa_shares c JOIN farms f ON f.id = c.farm_id WHERE c.id = ? AND c.removed = 0').get(id);
   if (!row) throw fail(404, 'Share not found.'); if (row.owner_id !== userId) throw fail(403, 'That is not your share.'); return row;
 }
-app.post('/api/farms/:id/csa', requireAuth('farmer'), wrap((req, res) => {
+app.post('/api/farms/:id/csa', requireAuth(), wrap((req, res) => {
   ownedFarm(req.params.id, req.user.id); const c = shareFromBody(req.body);
   const r = db.prepare('INSERT INTO csa_shares (farm_id,name,about,price_cents,per,season,pickup,spots) VALUES (?,?,?,?,?,?,?,?)')
     .run(req.params.id, c.name, c.about, c.price_cents, c.per, c.season, c.pickup, c.spots);
   res.status(201).json({ id: Number(r.lastInsertRowid) });
 }));
-app.put('/api/csa/:id', requireAuth('farmer'), wrap((req, res) => {
+app.put('/api/csa/:id', requireAuth(), wrap((req, res) => {
   ownedShare(req.params.id, req.user.id); const c = shareFromBody(req.body);
   db.prepare('UPDATE csa_shares SET name=?,about=?,price_cents=?,per=?,season=?,pickup=?,spots=? WHERE id=?').run(c.name, c.about, c.price_cents, c.per, c.season, c.pickup, c.spots, req.params.id);
   res.json({ ok: true });
 }));
-app.patch('/api/csa/:id/active', requireAuth('farmer'), wrap((req, res) => {
+app.patch('/api/csa/:id/active', requireAuth(), wrap((req, res) => {
   ownedShare(req.params.id, req.user.id); db.prepare('UPDATE csa_shares SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, req.params.id); res.json({ ok: true });
 }));
-app.delete('/api/csa/:id', requireAuth('farmer'), wrap((req, res) => {
+app.delete('/api/csa/:id', requireAuth(), wrap((req, res) => {
   ownedShare(req.params.id, req.user.id); db.prepare('UPDATE csa_shares SET removed = 1, active = 0 WHERE id = ?').run(req.params.id); res.json({ ok: true });
 }));
-app.post('/api/csa/:id/signup', requireAuth('buyer'), wrap((req, res) => {
+app.post('/api/csa/:id/signup', requireAuth(), wrap((req, res) => {
   const c = db.prepare('SELECT * FROM csa_shares WHERE id = ? AND active = 1 AND removed = 0').get(req.params.id);
   if (!c) throw fail(404, 'This share is no longer offered.');
+  ownFarmGuard(db.prepare('SELECT owner_id FROM farms WHERE id = ?').get(c.farm_id), req.user.id);
   const contact = str(req.body.contact, 120); if (!contact) throw fail(400, 'Add a phone number or email so the farmer can reach you.');
   if (db.prepare("SELECT 1 FROM csa_signups WHERE share_id = ? AND buyer_id = ? AND status IN ('requested','confirmed')").get(c.id, req.user.id)) throw fail(409, 'You already signed up for this share.');
   db.exec('BEGIN IMMEDIATE');
@@ -673,25 +711,29 @@ app.post('/api/csa/:id/signup', requireAuth('buyer'), wrap((req, res) => {
     const r = db.prepare('INSERT INTO csa_signups (buyer_id,share_id,farm_id,title,price_cents,per,contact,note) VALUES (?,?,?,?,?,?,?,?)')
       .run(req.user.id, c.id, c.farm_id, c.name, c.price_cents, c.per, contact, str(req.body.note, 500));
     db.exec('COMMIT');
+    notify(ownerEmail(c.farm_id), `New CSA sign-up: ${c.name}`, [`${userName(req.user.id)} wants a ${c.name} share.`, `Contact: ${contact}`, 'Confirm it under CSA in your dashboard.'], '/dashboard');
     res.status(201).json({ id: Number(r.lastInsertRowid) });
   } catch (e) { db.exec('ROLLBACK'); throw e; }
 }));
-app.get('/api/csa-signups/mine', requireAuth('buyer'), wrap((req, res) => {
+app.get('/api/csa-signups/mine', requireAuth(), wrap((req, res) => {
   res.json({ signups: db.prepare(`SELECT s.*, f.name AS farm_name, f.currency, f.phone AS farm_phone, f.payment_note, c.season, c.pickup
     FROM csa_signups s JOIN farms f ON f.id = s.farm_id JOIN csa_shares c ON c.id = s.share_id WHERE s.buyer_id = ? ORDER BY s.id DESC`).all(req.user.id) });
 }));
-app.get('/api/farm-csa-signups', requireAuth('farmer'), wrap((req, res) => {
+app.get('/api/farm-csa-signups', requireAuth(), wrap((req, res) => {
   res.json({ signups: db.prepare(`SELECT s.*, f.currency, u.name AS buyer_name, u.email AS buyer_email FROM csa_signups s
     JOIN farms f ON f.id = s.farm_id JOIN users u ON u.id = s.buyer_id WHERE f.owner_id = ? ORDER BY s.id DESC`).all(req.user.id) });
 }));
 app.patch('/api/csa-signups/:id/status', requireAuth(), wrap((req, res) => {
   const s = db.prepare('SELECT s.*, f.owner_id FROM csa_signups s JOIN farms f ON f.id = s.farm_id WHERE s.id = ?').get(req.params.id);
   if (!s) throw fail(404, 'Sign-up not found.');
-  const isFarmer = req.user.role === 'farmer' && s.owner_id === req.user.id, isMember = req.user.role === 'buyer' && s.buyer_id === req.user.id;
+  const isFarmer = s.owner_id === req.user.id, isMember = !isFarmer && s.buyer_id === req.user.id;
   if (!isFarmer && !isMember) throw fail(403, 'Not your sign-up.');
   const allowed = isFarmer ? { requested: ['confirmed', 'declined'], confirmed: ['cancelled'] } : { requested: ['cancelled'], confirmed: ['cancelled'] };
   if (!(allowed[s.status] || []).includes(req.body.status)) throw fail(400, `This sign-up is ${s.status} and can't be changed that way.`);
   db.prepare('UPDATE csa_signups SET status = ? WHERE id = ?').run(req.body.status, s.id);
+  const sf = db.prepare('SELECT name FROM farms WHERE id = ?').get(s.farm_id).name;
+  if (isFarmer) notify(userEmail(s.buyer_id), `${sf}: your ${s.title} share was ${req.body.status}`, [req.body.status === 'confirmed' ? 'Welcome to the CSA. The farm will be in touch about the first pickup.' : 'Contact the farm if you have questions.'], '/orders');
+  else notify(ownerEmail(s.farm_id), `${userName(s.buyer_id)} cancelled a ${s.title} share`, ['A spot opened up.'], '/dashboard');
   res.json({ ok: true });
 }));
 
@@ -723,24 +765,25 @@ app.get('/api/events', wrap((req, res) => {
       distance_miles: near ? near.get(e.farm_id).distance_miles : null }; });
   res.json({ events: rows });
 }));
-app.post('/api/farms/:id/events', requireAuth('farmer'), wrap((req, res) => {
+app.post('/api/farms/:id/events', requireAuth(), wrap((req, res) => {
   const farm = ownedFarm(req.params.id, req.user.id); const e = eventFromBody(req.body);
   const r = db.prepare('INSERT INTO events (farm_id,title,about,date,start_time,end_time,location,price_cents,capacity) VALUES (?,?,?,?,?,?,?,?,?)')
     .run(farm.id, e.title, e.about, e.date, e.start_time, e.end_time, e.location || farm.name, e.price_cents, e.capacity);
   res.status(201).json({ id: Number(r.lastInsertRowid) });
 }));
-app.put('/api/events/:id', requireAuth('farmer'), wrap((req, res) => {
+app.put('/api/events/:id', requireAuth(), wrap((req, res) => {
   ownedEvent(req.params.id, req.user.id); const e = eventFromBody(req.body);
   db.prepare('UPDATE events SET title=?,about=?,date=?,start_time=?,end_time=?,location=?,price_cents=?,capacity=? WHERE id=?')
     .run(e.title, e.about, e.date, e.start_time, e.end_time, e.location, e.price_cents, e.capacity, req.params.id);
   res.json({ ok: true });
 }));
-app.delete('/api/events/:id', requireAuth('farmer'), wrap((req, res) => {
+app.delete('/api/events/:id', requireAuth(), wrap((req, res) => {
   ownedEvent(req.params.id, req.user.id); db.prepare('UPDATE events SET removed = 1 WHERE id = ?').run(req.params.id); res.json({ ok: true });
 }));
-app.post('/api/events/:id/rsvp', requireAuth('buyer'), wrap((req, res) => {
+app.post('/api/events/:id/rsvp', requireAuth(), wrap((req, res) => {
   const e = db.prepare('SELECT * FROM events WHERE id = ? AND removed = 0').get(req.params.id);
   if (!e || e.date < today()) throw fail(404, 'This event is over or was cancelled.');
+  ownFarmGuard(db.prepare('SELECT owner_id FROM farms WHERE id = ?').get(e.farm_id), req.user.id);
   const people = Math.floor(num(req.body.people)); if (!(people >= 1)) throw fail(400, 'Enter how many people are coming.');
   if (db.prepare("SELECT 1 FROM event_rsvps WHERE event_id = ? AND buyer_id = ? AND status = 'going'").get(e.id, req.user.id)) throw fail(409, "You're already going to this event.");
   db.exec('BEGIN IMMEDIATE');
@@ -748,18 +791,20 @@ app.post('/api/events/:id/rsvp', requireAuth('buyer'), wrap((req, res) => {
     const left = publicEvent(e).spots_left;
     if (left !== null && people > left) throw fail(409, left ? `Only ${left} ${left === 1 ? 'spot is' : 'spots are'} left.` : 'This event is full.');
     const r = db.prepare('INSERT INTO event_rsvps (buyer_id,event_id,farm_id,people,contact) VALUES (?,?,?,?,?)').run(req.user.id, e.id, e.farm_id, people, str(req.body.contact, 120));
-    db.exec('COMMIT'); res.status(201).json({ id: Number(r.lastInsertRowid) });
+    db.exec('COMMIT');
+    notify(ownerEmail(e.farm_id), `${userName(req.user.id)} is coming to ${e.title}`, [`${people} ${people === 1 ? 'person' : 'people'} for ${e.title} on ${e.date}.`], '/dashboard');
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
   } catch (ex) { db.exec('ROLLBACK'); throw ex; }
 }));
-app.get('/api/rsvps/mine', requireAuth('buyer'), wrap((req, res) => {
+app.get('/api/rsvps/mine', requireAuth(), wrap((req, res) => {
   res.json({ rsvps: db.prepare(`SELECT r.*, e.title, e.date, e.start_time, e.end_time, e.location, e.price_cents, f.name AS farm_name, f.currency, f.lat, f.lng, f.address
     FROM event_rsvps r JOIN events e ON e.id = r.event_id JOIN farms f ON f.id = r.farm_id WHERE r.buyer_id = ? ORDER BY e.date DESC`).all(req.user.id) });
 }));
-app.get('/api/farm-rsvps', requireAuth('farmer'), wrap((req, res) => {
+app.get('/api/farm-rsvps', requireAuth(), wrap((req, res) => {
   res.json({ rsvps: db.prepare(`SELECT r.*, e.title, e.date, u.name AS buyer_name, u.email AS buyer_email FROM event_rsvps r JOIN events e ON e.id = r.event_id
     JOIN farms f ON f.id = r.farm_id JOIN users u ON u.id = r.buyer_id WHERE f.owner_id = ? ORDER BY e.date, r.id`).all(req.user.id) });
 }));
-app.patch('/api/rsvps/:id/cancel', requireAuth('buyer'), wrap((req, res) => {
+app.patch('/api/rsvps/:id/cancel', requireAuth(), wrap((req, res) => {
   const r = db.prepare('SELECT * FROM event_rsvps WHERE id = ? AND buyer_id = ?').get(req.params.id, req.user.id);
   if (!r) throw fail(404, 'RSVP not found.');
   db.prepare("UPDATE event_rsvps SET status = 'cancelled' WHERE id = ?").run(r.id); res.json({ ok: true });
@@ -767,7 +812,7 @@ app.patch('/api/rsvps/:id/cancel', requireAuth('buyer'), wrap((req, res) => {
 
 // ---------- orders ----------
 // Reserving holds stock. Payment happens directly between buyer and farmer; the platform takes no cut.
-app.post('/api/orders', requireAuth('buyer'), wrap((req, res) => {
+app.post('/api/orders', requireAuth(), wrap((req, res) => {
   const farmId = Number(req.body.farm_id);
   const fulfillment = req.body.fulfillment === 'delivery' ? 'delivery' : 'pickup';
   const items = Array.isArray(req.body.items) ? req.body.items : [];
@@ -775,11 +820,18 @@ app.post('/api/orders', requireAuth('buyer'), wrap((req, res) => {
 
   const farm = db.prepare('SELECT * FROM farms WHERE id = ?').get(farmId);
   if (!farm) throw fail(404, 'Farm not found.');
-  if (fulfillment === 'pickup' && !farm.pickup_enabled) throw fail(400, 'This farm does not offer pickup.');
+  ownFarmGuard(farm, req.user.id);
+  const groupId = req.body.group_id ? Number(req.body.group_id) : null;
+  let group = null;
+  if (groupId) {
+    group = db.prepare('SELECT * FROM group_orders WHERE id = ?').get(groupId);
+    if (!group || group.farm_id !== farm.id) throw fail(404, 'Group order not found.');
+    if (group.status !== 'open' || group.deadline < today()) throw fail(400, 'This group order is closed to new orders.');
+  } else if (fulfillment === 'pickup' && !farm.pickup_enabled) throw fail(400, 'This farm does not offer pickup.');
 
   let deliveryFee = 0;
-  let deliveryAddress = '';
-  if (fulfillment === 'delivery') {
+  let deliveryAddress = group ? `${group.dropoff_name}${group.dropoff_address ? ', ' + group.dropoff_address : ''}` : '';
+  if (fulfillment === 'delivery' && !group) {
     if (!farm.delivery_enabled) throw fail(400, 'This farm does not offer delivery.');
     deliveryAddress = str(req.body.delivery_address, 300);
     if (!deliveryAddress) throw fail(400, 'Enter a delivery address.');
@@ -814,15 +866,22 @@ app.post('/api/orders', requireAuth('buyer'), wrap((req, res) => {
       total += Math.round(l.price_cents * qty);
     }
     const o = db
-      .prepare(`INSERT INTO orders (buyer_id,farm_id,fulfillment,delivery_address,scheduled_for,note,items_total_cents,delivery_fee_cents)
-        VALUES (?,?,?,?,?,?,?,?)`)
-      .run(req.user.id, farmId, fulfillment, deliveryAddress, str(req.body.scheduled_for, 100),
-        str(req.body.note, 500), total, deliveryFee);
+      .prepare(`INSERT INTO orders (buyer_id,farm_id,fulfillment,delivery_address,scheduled_for,note,items_total_cents,delivery_fee_cents,group_id)
+        VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(req.user.id, farmId, group ? 'pickup' : fulfillment, deliveryAddress, group ? group.deliver_date : str(req.body.scheduled_for, 100),
+        str(req.body.note, 500), total, deliveryFee, groupId);
     const insItem = db.prepare(
       'INSERT INTO order_items (order_id,listing_id,name,unit,price_cents,qty) VALUES (?,?,?,?,?,?)'
     );
     for (const { l, qty } of lines) insItem.run(o.lastInsertRowid, l.id, l.name, l.unit, l.price_cents, qty);
     db.exec('COMMIT');
+    const buyer = userName(req.user.id), list = lines.map(({ l, qty }) => `- ${l.name}, ${qty} ${l.unit}`);
+    if (group) {
+      notify(ownerEmail(farm.id), `${buyer} joined your group order for ${group.dropoff_name}`, [`${buyer} added an order to the group order delivering to ${group.dropoff_name} on ${group.deliver_date}:`, ...list], '/dashboard');
+      if (group.host_kind === 'neighbor' && group.host_id !== req.user.id) notify(userEmail(group.host_id), `${buyer} joined your group order`, [`${buyer} joined the group order from ${farm.name} that you are hosting.`], `/group/${group.id}`);
+    } else {
+      notify(ownerEmail(farm.id), `New order from ${buyer}`, [`${buyer} reserved (${fulfillment}):`, ...list, `Total: ${(total + deliveryFee) / 100} ${farm.currency}`], '/dashboard');
+    }
     res.status(201).json({
       id: Number(o.lastInsertRowid),
       total_cents: total + deliveryFee,
@@ -839,16 +898,17 @@ function ordersWithItems(rows) {
   return rows.map((o) => ({ ...o, items: stmt.all(o.id) }));
 }
 
-app.get('/api/orders/mine', requireAuth('buyer'), wrap((req, res) => {
+app.get('/api/orders/mine', requireAuth(), wrap((req, res) => {
   const rows = db
     .prepare(`SELECT o.*, f.name AS farm_name, f.address AS farm_address, f.city AS farm_city,
-        f.phone AS farm_phone, f.lat AS farm_lat, f.lng AS farm_lng, f.pickup_instructions, f.payment_note, f.currency
-      FROM orders o JOIN farms f ON f.id = o.farm_id WHERE o.buyer_id = ? ORDER BY o.id DESC`)
+        f.phone AS farm_phone, f.lat AS farm_lat, f.lng AS farm_lng, f.pickup_instructions, f.payment_note, f.currency,
+        g.dropoff_name AS group_dropoff, g.deliver_date AS group_date, g.status AS group_status, g.discount_pct AS group_discount
+      FROM orders o JOIN farms f ON f.id = o.farm_id LEFT JOIN group_orders g ON g.id = o.group_id WHERE o.buyer_id = ? ORDER BY o.id DESC`)
     .all(req.user.id);
   res.json({ orders: ordersWithItems(rows) });
 }));
 
-app.get('/api/farm-orders', requireAuth('farmer'), wrap((req, res) => {
+app.get('/api/farm-orders', requireAuth(), wrap((req, res) => {
   const rows = db
     .prepare(`SELECT o.*, f.name AS farm_name, f.currency, u.name AS buyer_name, u.email AS buyer_email
       FROM orders o JOIN farms f ON f.id = o.farm_id JOIN users u ON u.id = o.buyer_id
@@ -865,8 +925,8 @@ app.patch('/api/orders/:id/status', requireAuth(), wrap((req, res) => {
     .get(req.params.id);
   if (!order) throw fail(404, 'Order not found.');
 
-  const isFarmer = req.user.role === 'farmer' && order.owner_id === req.user.id;
-  const isBuyer = req.user.role === 'buyer' && order.buyer_id === req.user.id;
+  const isFarmer = order.owner_id === req.user.id;
+  const isBuyer = !isFarmer && order.buyer_id === req.user.id;
   if (!isFarmer && !isBuyer) throw fail(403, 'Not your order.');
   if (isBuyer && status !== 'cancelled') throw fail(403, 'Buyers can only cancel.');
   if (['completed', 'cancelled'].includes(order.status)) throw fail(400, `Order is already ${order.status}.`);
@@ -884,8 +944,119 @@ app.patch('/api/orders/:id/status', requireAuth(), wrap((req, res) => {
     db.exec('ROLLBACK');
     throw e;
   }
+  const fname = db.prepare('SELECT name FROM farms WHERE id = ?').get(order.farm_id).name;
+  if (isFarmer) notify(userEmail(order.buyer_id), { ready: `Your order from ${fname} is ready`, completed: `Thanks for buying from ${fname}`, cancelled: `${fname} cancelled your order` }[status],
+    [{ ready: `${fname} marked your order ready.`, completed: `${fname} marked your order picked up or delivered.`, cancelled: `${fname} cancelled your order. Reach out to them if you have questions.` }[status]], '/orders');
+  else notify(ownerEmail(order.farm_id), `${userName(order.buyer_id)} cancelled an order`, ['The produce went back on sale.'], '/dashboard');
   res.json({ ok: true });
 }));
+
+// ---------- group orders ----------
+const groupTotal = db.prepare("SELECT COALESCE(SUM(items_total_cents),0) AS cents, COUNT(DISTINCT buyer_id) AS households FROM orders WHERE group_id = ? AND status != 'cancelled'");
+function publicGroup(g, farm) {
+  const t = groupTotal.get(g.id);
+  farm = farm || db.prepare('SELECT * FROM farms WHERE id = ?').get(g.farm_id);
+  return { id: g.id, farm_id: g.farm_id, farm_name: farm.name, farm_kind: farm.kind, currency: farm.currency, host_kind: g.host_kind,
+    host_name: g.host_kind === 'farm' ? farm.name : userName(g.host_id).split(' ')[0], dropoff_name: g.dropoff_name, dropoff_address: g.dropoff_address,
+    lat: g.lat, lng: g.lng, place_label: g.place_label, deliver_date: g.deliver_date, deadline: g.deadline, note: g.note, status: g.status,
+    open: g.status === 'open' && g.deadline >= today(), total_cents: t.cents, households: t.households,
+    min_cents: farm.group_min_cents, discount_pct: farm.group_discount_pct, discount_over_cents: farm.group_discount_over_cents, applied_discount_pct: g.discount_pct };
+}
+function openGroups({ lat, lng, radius, farmId }) {
+  const rows = db.prepare("SELECT * FROM group_orders WHERE status = 'open' AND deadline >= ? ORDER BY deliver_date").all(today());
+  const hasLoc = Number.isFinite(lat) && Number.isFinite(lng);
+  return rows.filter((g) => !farmId || g.farm_id === farmId)
+    .map((g) => ({ ...publicGroup(g), distance_miles: hasLoc ? miles(lat, lng, g.lat, g.lng) : null }))
+    .filter((g) => !hasLoc || !(radius > 0) || g.distance_miles <= radius)
+    .sort((a, b) => (hasLoc ? a.distance_miles - b.distance_miles : 0) || a.deliver_date.localeCompare(b.deliver_date));
+}
+app.get('/api/groups', wrap((req, res) => {
+  res.json({ groups: openGroups({ lat: num(req.query.lat), lng: num(req.query.lng), radius: num(req.query.radius), farmId: num(req.query.farm_id) || null }) });
+}));
+app.get('/api/groups/:id', wrap((req, res) => {
+  const g = db.prepare('SELECT * FROM group_orders WHERE id = ?').get(req.params.id);
+  if (!g) throw fail(404, 'Group order not found.');
+  const farm = db.prepare('SELECT * FROM farms WHERE id = ?').get(g.farm_id);
+  const out = { group: publicGroup(g, farm), farm: publicFarm(farm),
+    listings: db.prepare('SELECT * FROM listings WHERE farm_id = ? AND active = 1 AND qty_available > 0 ORDER BY name').all(farm.id) };
+  if (req.user) {
+    const canSee = farm.owner_id === req.user.id || g.host_id === req.user.id;
+    const rows = db.prepare(`SELECT o.*, u.name AS buyer_name, u.email AS buyer_email FROM orders o JOIN users u ON u.id = o.buyer_id
+      WHERE o.group_id = ? AND o.status != 'cancelled' ${canSee ? '' : 'AND o.buyer_id = ?'} ORDER BY o.id`).all(...(canSee ? [g.id] : [g.id, req.user.id]));
+    out.orders = ordersWithItems(rows);
+    out.role = farm.owner_id === req.user.id ? 'farm' : g.host_id === req.user.id ? 'host' : 'member';
+  }
+  res.json(out);
+}));
+app.post('/api/farms/:id/groups', requireAuth(), wrap((req, res) => {
+  const farm = db.prepare('SELECT * FROM farms WHERE id = ?').get(req.params.id);
+  if (!farm) throw fail(404, 'Farm not found.');
+  const isFarm = farm.owner_id === req.user.id;
+  if (!isFarm && !farm.group_orders) throw fail(400, 'This farm does not take group orders yet.');
+  const dropoff = str(req.body.dropoff_name, 120); if (!dropoff) throw fail(400, 'Name the drop-off spot, for example "Celina library parking lot".');
+  const lat = num(req.body.lat), lng = num(req.body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw fail(400, 'Choose the town for the drop-off.');
+  const deliver = str(req.body.deliver_date, 10), deadline = str(req.body.deadline, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(deliver) || !/^\d{4}-\d{2}-\d{2}$/.test(deadline)) throw fail(400, 'Pick the order deadline and the delivery date.');
+  if (deadline < today()) throw fail(400, 'The order deadline has already passed.');
+  if (deliver < deadline) throw fail(400, 'Delivery has to be on or after the order deadline.');
+  const d = miles(lat, lng, farm.lat, farm.lng);
+  if (!isFarm && farm.group_radius_miles > 0 && d > farm.group_radius_miles) throw fail(400, `${farm.name} delivers group orders within ${farm.group_radius_miles} miles. That spot is about ${Math.round(d)} miles away.`);
+  const place = cities.nearest(lat, lng);
+  const r = db.prepare(`INSERT INTO group_orders (farm_id,host_id,host_kind,dropoff_name,dropoff_address,lat,lng,place_label,deliver_date,deadline,note) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(farm.id, req.user.id, isFarm ? 'farm' : 'neighbor', dropoff, str(req.body.dropoff_address, 200), lat, lng, place ? place.label : '', deliver, deadline, str(req.body.note, 500));
+  if (!isFarm) notify(ownerEmail(farm.id), `${userName(req.user.id)} started a group order for ${dropoff}`,
+    [`A neighbor is collecting orders for one delivery to ${dropoff} on ${deliver}. Orders close ${deadline}.`, 'See it under Group orders in your dashboard. You can cancel it if you cannot deliver.'], '/dashboard');
+  res.status(201).json({ id: Number(r.lastInsertRowid) });
+}));
+app.post('/api/groups/:id/status', requireAuth(), wrap((req, res) => {
+  const g = db.prepare('SELECT g.*, f.owner_id, f.name AS farm_name, f.group_discount_pct, f.group_discount_over_cents FROM group_orders g JOIN farms f ON f.id = g.farm_id WHERE g.id = ?').get(req.params.id);
+  if (!g) throw fail(404, 'Group order not found.');
+  const status = req.body.status, isFarm = g.owner_id === req.user.id, isHost = g.host_id === req.user.id;
+  const allowed = isFarm ? { open: ['confirmed', 'cancelled'], confirmed: ['delivered', 'cancelled'] } : isHost ? { open: ['cancelled'] } : {};
+  if (!(allowed[g.status] || []).includes(status)) throw fail(403, `You can't change this group order to ${status}.`);
+  const members = db.prepare("SELECT DISTINCT buyer_id FROM orders WHERE group_id = ? AND status != 'cancelled'").all(g.id).map((r) => r.buyer_id);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (status === 'confirmed') {
+      const t = groupTotal.get(g.id).cents;
+      const pct = g.group_discount_pct && t >= g.group_discount_over_cents ? g.group_discount_pct : 0;
+      db.prepare('UPDATE group_orders SET status = ?, discount_pct = ? WHERE id = ?').run('confirmed', pct, g.id);
+      db.prepare("UPDATE orders SET status = 'ready' WHERE group_id = ? AND status = 'reserved'").run(g.id);
+    } else if (status === 'delivered') {
+      db.prepare("UPDATE group_orders SET status = 'delivered' WHERE id = ?").run(g.id);
+      db.prepare("UPDATE orders SET status = 'completed' WHERE group_id = ? AND status IN ('reserved','ready')").run(g.id);
+    } else {
+      const open = db.prepare("SELECT id FROM orders WHERE group_id = ? AND status IN ('reserved','ready')").all(g.id);
+      const restore = db.prepare('UPDATE listings SET qty_available = qty_available + ? WHERE id = ?');
+      for (const o of open) for (const l of db.prepare('SELECT listing_id, qty FROM order_items WHERE order_id = ?').all(o.id)) restore.run(l.qty, l.listing_id);
+      db.prepare("UPDATE orders SET status = 'cancelled' WHERE group_id = ? AND status IN ('reserved','ready')").run(g.id);
+      db.prepare("UPDATE group_orders SET status = 'cancelled' WHERE id = ?").run(g.id);
+    }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  const msg = { confirmed: [`${g.farm_name} confirmed the group order`, `Your order will be delivered to ${g.dropoff_name} on ${g.deliver_date}.`],
+    delivered: [`Your group order from ${g.farm_name} was delivered`, `It was dropped off at ${g.dropoff_name}.`],
+    cancelled: [`The group order for ${g.dropoff_name} was cancelled`, 'Nothing was charged. Your items went back on sale.'] }[status];
+  for (const m of members) notify(userEmail(m), msg[0], [msg[1]], `/group/${g.id}`);
+  if (isHost && !isFarm) notify(userEmail(g.owner_id), `The group order for ${g.dropoff_name} was cancelled by its host`, ['No delivery is needed.'], '/dashboard');
+  res.json({ ok: true });
+}));
+app.get('/api/farm-groups', requireAuth(), wrap((req, res) => {
+  const rows = db.prepare('SELECT g.* FROM group_orders g JOIN farms f ON f.id = g.farm_id WHERE f.owner_id = ? ORDER BY g.deliver_date DESC').all(req.user.id);
+  res.json({ groups: rows.map((g) => {
+    const orders = ordersWithItems(db.prepare(`SELECT o.*, u.name AS buyer_name, u.email AS buyer_email FROM orders o JOIN users u ON u.id = o.buyer_id
+      WHERE o.group_id = ? AND o.status != 'cancelled' ORDER BY u.name`).all(g.id));
+    const pick = {};
+    for (const o of orders) for (const i of o.items) { const k = `${i.name}|${i.unit}`; (pick[k] ||= { name: i.name, unit: i.unit, qty: 0 }).qty += i.qty; }
+    return { ...publicGroup(g), orders, picking: Object.values(pick).sort((a, b) => a.name.localeCompare(b.name)) };
+  }) });
+}));
+app.get('/api/groups-hosting', requireAuth(), wrap((req, res) => {
+  res.json({ groups: db.prepare("SELECT * FROM group_orders WHERE host_id = ? AND host_kind = 'neighbor' ORDER BY deliver_date DESC").all(req.user.id).map((g) => publicGroup(g)) });
+}));
+app.get('/api/email-status', (_req, res) => res.json({ enabled: emailEnabled }));
+
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found.' }));
 // Every other page address (/, /celina-tx, /farm/12, /dashboard...) is handled by the single-page app.

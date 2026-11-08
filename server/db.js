@@ -242,6 +242,31 @@ CREATE TABLE IF NOT EXISTS event_rsvps (
 );
 `);
 
+// ---------- group orders (neighbors order together for one drop-off) ----------
+for (const [col, def] of [['group_orders', 'INTEGER NOT NULL DEFAULT 0'], ['group_min_cents', 'INTEGER NOT NULL DEFAULT 0'],
+  ['group_discount_pct', 'INTEGER NOT NULL DEFAULT 0'], ['group_discount_over_cents', 'INTEGER NOT NULL DEFAULT 0'], ['group_radius_miles', 'REAL NOT NULL DEFAULT 25']]) addColumn('farms', col, def);
+addColumn('orders', 'group_id', 'INTEGER');
+db.exec(`
+CREATE TABLE IF NOT EXISTS group_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  farm_id INTEGER NOT NULL REFERENCES farms(id) ON DELETE CASCADE,
+  host_id INTEGER NOT NULL REFERENCES users(id),
+  host_kind TEXT NOT NULL CHECK (host_kind IN ('farm','neighbor')),
+  dropoff_name TEXT NOT NULL,
+  dropoff_address TEXT NOT NULL DEFAULT '',
+  lat REAL NOT NULL,
+  lng REAL NOT NULL,
+  place_label TEXT NOT NULL DEFAULT '',
+  deliver_date TEXT NOT NULL,
+  deadline TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','confirmed','delivered','cancelled')),
+  discount_pct INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_groups_farm ON group_orders(farm_id, status);
+`);
+
 // Name each listing's place after the nearest town in the built-in list (powers city pages like /celina-tx).
 function setPlace(farmId) {
   const f = db.prepare('SELECT lat, lng FROM farms WHERE id = ?').get(farmId);
@@ -397,4 +422,18 @@ function seedExtras() {
   for (const f of db.prepare("SELECT id FROM farms WHERE place_slug = ''").all()) setPlace(f.id);
 }
 
-module.exports = { db, seed, seedExtras, setPlace, KINDS, CATEGORIES };
+// Demo group orders (added once).
+function seedGroups() {
+  if (db.prepare('SELECT 1 FROM group_orders').get()) return;
+  const farm = (email) => db.prepare('SELECT f.id, f.owner_id FROM farms f JOIN users u ON u.id = f.owner_id WHERE u.email = ?').get(email);
+  const blue = farm('bluebonnet@demo.farm'), ranch = farm('mckinney@demo.farm');
+  const buyer = db.prepare("SELECT id FROM users WHERE email = 'buyer@demo.farm'").get();
+  if (!blue || !ranch || !buyer) return;
+  db.prepare('UPDATE farms SET group_orders = 1, group_min_cents = 15000, group_discount_pct = 10, group_discount_over_cents = 30000, group_radius_miles = 25 WHERE id IN (?, ?)').run(blue.id, ranch.id);
+  const add = db.prepare(`INSERT INTO group_orders (farm_id,host_id,host_kind,dropoff_name,dropoff_address,lat,lng,place_label,deliver_date,deadline,note)
+    VALUES (?,?,?,?,?,?,?,?,date('now', ?),date('now', ?),?)`);
+  add.run(blue.id, blue.owner_id, 'farm', 'Celina Public Library parking lot', '142 N Ohio St, Celina', 33.3245, -96.7843, 'Celina, TX', '+6 day', '+4 day', 'Weekly drop-off. Look for the green truck, 5 to 6pm.');
+  add.run(ranch.id, buyer.id, 'neighbor', 'Wilson Creek neighborhood, Maple Ct', 'Maple Ct cul-de-sac, McKinney', 33.205, -96.65, 'McKinney, TX', '+8 day', '+5 day', 'Hosted by a neighbor. Pick up from my porch the evening of delivery.');
+}
+
+module.exports = { db, seed, seedExtras, seedGroups, setPlace, KINDS, CATEGORIES };
