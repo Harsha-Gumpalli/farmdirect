@@ -1,0 +1,17 @@
+{
+  "name": "farmdirect",
+  "version": "0.1.0",
+  "description": "Farm-to-buyer marketplace: farmers post harvest, locals reserve direct. No middlemen.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --watch --disable-warning=ExperimentalWarning server/index.js"
+  },
+  "dependencies": {
+    "express": "^5.3.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.5"
+  }
+}

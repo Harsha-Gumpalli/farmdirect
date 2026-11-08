@@ -1,0 +1,19 @@
+# One-click deploy on Render: New > Blueprint, pick this repository.
+# A persistent disk needs a paid instance (Starter); on the free plan the database resets on every deploy.
+services:
+  - type: web
+    name: farmdirect
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      name: farmdirect-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SEED_DEMO
+        value: "true"
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false

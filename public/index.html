@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FarmDirect — buy from the farmer who grew it</title>
+  <meta name="description" content="Find farms and barns near you, see what was just harvested, and reserve it straight from the farmer. No middlemen.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip" href="#view">Skip to content</a>
+
+  <header class="top">
+    <a class="brand" href="/" aria-label="FarmDirect home">
+      <span class="brand-mark" aria-hidden="true"></span>FarmDirect
+    </a>
+    <nav id="nav" aria-label="Main"></nav>
+  </header>
+
+  <main id="view" tabindex="-1"></main>
+
+  <dialog id="authDialog" aria-labelledby="authTitle"></dialog>
+  <dialog id="farmDialog" aria-labelledby="farmTitle"></dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
