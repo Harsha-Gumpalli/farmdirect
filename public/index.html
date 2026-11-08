@@ -3,29 +3,39 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FarmDirect — buy from the farmer who grew it</title>
-  <meta name="description" content="Find farms and barns near you, see what was just harvested, and reserve it straight from the farmer. No middlemen.">
+  <title>FarmDirect: local farms, markets, CSA and farm days</title>
+  <meta name="description" content="Find farms, farmers markets, farm stands, CSA shares, u-pick and farm events near you. Buy straight from the farmer, with no middlemen.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <a class="skip" href="#view">Skip to content</a>
-
-  <header class="top">
-    <a class="brand" href="/" aria-label="FarmDirect home">
-      <span class="brand-mark" aria-hidden="true"></span>FarmDirect
-    </a>
-    <nav id="nav" aria-label="Main"></nav>
+  <header class="site-head">
+    <div class="band"><div class="wrap band-in">
+      <a class="brand" href="/" data-link><span class="leaf" aria-hidden="true"></span>FarmDirect</a>
+      <button type="button" class="local-to" id="localTo" aria-haspopup="dialog"></button>
+      <div class="account" id="account"></div>
+    </div></div>
+    <nav class="tabbar" aria-label="Sections"><div class="wrap" id="tabs"></div></nav>
   </header>
 
   <main id="view" tabindex="-1"></main>
 
-  <dialog id="authDialog" aria-labelledby="authTitle"></dialog>
-  <dialog id="farmDialog" aria-labelledby="farmTitle"></dialog>
+  <footer class="site-foot"><div class="wrap foot-in">
+    <div><span class="brand small"><span class="leaf" aria-hidden="true"></span>FarmDirect</span>
+      <p>Buy straight from the people who grow it. No middlemen and no fees: you pay the farm directly.</p></div>
+    <div><h2>Find</h2><ul id="footFind"></ul></div>
+    <div><h2>For farms and markets</h2><ul>
+      <li><a href="/dashboard" data-link>List your farm, market or stand</a></li>
+      <li><a href="/updates" data-link>Farm updates</a></li>
+      <li><a href="/cities" data-link>Towns with listings</a></li></ul></div>
+  </div></footer>
 
+  <dialog id="authDialog" aria-labelledby="authTitle"></dialog>
+  <dialog id="dlg" aria-labelledby="dlgTitle"></dialog>
   <div id="toast" role="status" aria-live="polite"></div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

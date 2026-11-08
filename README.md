@@ -2,6 +2,14 @@
 
 A farm-to-buyer marketplace that works anywhere in the world. Farmers post what they harvested, locals find nearby farms and barns on a map, reserve produce, and pay the farmer directly. No middlemen and no platform cut. Each farm sets its own currency, and buyers find farms by typing any town, address or Google Maps link, or by sharing their location.
 
+## What's on the site
+
+- **Town pages** like `/celina-tx` or `/hyderabad-in` for any of ~24,600 towns: featured farms, farmers' markets, local products by category, what's in season, a photo gallery, upcoming events, CSA shares and farm days, plus a map.
+- **Directory** with a type filter (farms, farmers' markets, u-pick, farm stands, CSA, farm days, wholesale, restaurants, groceries, accepts SNAP), product filter, search and distance, as a list and a map. Addresses like `/celina-tx/markets` or `/celina-tx/products/eggs`.
+- **Listing pages** (`/farm/12`) with about, products to reserve, CSA sign-up, farm days to book, events to RSVP, photo updates, map, hours, directions and SNAP/wholesale badges.
+- **For buyers:** My orders shows produce orders, CSA memberships, bookings and events.
+- **For farms, markets and stands:** a dashboard with tabs for orders, bookings, CSA members and shares, events and RSVPs, products, farm days, photos and updates, and listing details.
+
 ## Run it
 
 Requires Node 22.5 or newer (uses the built-in `node:sqlite`).

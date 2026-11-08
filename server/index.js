@@ -2,11 +2,12 @@ const express = require('express');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
-const { db, seed } = require('./db');
+const { db, seed, seedExtras, setPlace, KINDS, CATEGORIES } = require('./db');
+const cities = require('./cities');
 const { hashPassword, verifyPassword, signToken, authenticate, requireAuth } = require('./auth');
 
 // Demo farms help people try the app. Set SEED_DEMO=false for a real launch with no example data.
-if (process.env.SEED_DEMO !== 'false') seed();
+if (process.env.SEED_DEMO !== 'false') { seed(); seedExtras(); }
 if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
   console.warn('SESSION_SECRET is not set: everyone will be signed out whenever the server restarts.');
 }
@@ -102,6 +103,12 @@ function publicFarm(f) {
     payment_note: f.payment_note,
     currency: f.currency || 'USD',
     cover_url: f.cover_url || '',
+    accepts_snap: !!f.accepts_snap,
+    wholesale: !!f.wholesale,
+    website: f.website || '',
+    hours: f.hours || '',
+    place_slug: f.place_slug || '',
+    place_label: f.place_label || f.city || '',
   };
 }
 
@@ -168,66 +175,148 @@ function publicExp(e) {
 
 // ---------- public browsing ----------
 // GET /api/farms?lat=&lng=&radius=&q=&category=&fulfillment=pickup|delivery
-app.get('/api/farms', wrap((req, res) => {
-  const lat = num(req.query.lat);
-  const lng = num(req.query.lng);
-  const radius = num(req.query.radius);
-  const q = str(req.query.q, 100).toLowerCase();
-  const category = str(req.query.category, 20);
-  const fulfillment = str(req.query.fulfillment, 20);
+// Which listings belong to each directory type (the row of filters on the site).
+const FARM_KINDS = ['farm', 'barn', 'orchard', 'ranch', 'garden'];
+const TYPE_TEST = {
+  farms: (f) => FARM_KINDS.includes(f.kind),
+  markets: (f) => f.kind === 'market',
+  farmstands: (f) => f.kind === 'farmstand',
+  restaurants: (f) => f.kind === 'restaurant',
+  groceries: (f) => f.kind === 'grocery',
+  others: (f) => f.kind === 'other',
+  upick: (f) => f.experiences.some((e) => e.type === 'pick'),
+  csa: (f) => f.csa_count > 0,
+  wholesale: (f) => f.wholesale,
+  experiences: (f) => f.experiences.length > 0,
+  events: (f) => f.event_count > 0,
+  snap: (f) => f.accepts_snap,
+};
+const today = () => new Date(Date.now() - 6 * 3600e3).toISOString().slice(0, 10); // a little behind UTC so US evenings still count as today
+const csaCount = db.prepare('SELECT COUNT(*) AS n FROM csa_shares WHERE farm_id = ? AND active = 1 AND removed = 0');
+const eventCount = db.prepare('SELECT COUNT(*) AS n FROM events WHERE farm_id = ? AND removed = 0 AND date >= ?');
+const postCount = db.prepare('SELECT COUNT(*) AS n FROM posts WHERE farm_id = ?');
+
+function directory({ lat, lng, radius, type = '', product = '', q = '', fulfillment = '', looking = '' }) {
   const hasLoc = Number.isFinite(lat) && Number.isFinite(lng);
-
-  const farms = db.prepare('SELECT * FROM farms').all();
-  const listingStmt = db.prepare(
-    'SELECT id,name,category,unit,price_cents,qty_available,harvest_date FROM listings WHERE farm_id = ? AND active = 1 AND qty_available > 0 ORDER BY name'
-  );
-  const looking = str(req.query.looking, 20);
-
-  let out = farms.map((f) => {
-    const items = listingStmt.all(f.id);
-    const distance = hasLoc ? miles(lat, lng, f.lat, f.lng) : null;
-    return { ...publicFarm(f), distance_miles: distance, items, experiences: activeExperiences.all(f.id).map(publicExp) };
-  });
+  const listingStmt = db.prepare('SELECT id,name,category,unit,price_cents,qty_available,harvest_date FROM listings WHERE farm_id = ? AND active = 1 AND qty_available > 0 ORDER BY name');
+  const t = today();
+  let out = db.prepare('SELECT * FROM farms').all().map((f) => ({
+    ...publicFarm(f), distance_miles: hasLoc ? miles(lat, lng, f.lat, f.lng) : null, items: listingStmt.all(f.id),
+    experiences: activeExperiences.all(f.id).map(publicExp), csa_count: csaCount.get(f.id).n, event_count: eventCount.get(f.id, t).n, post_count: postCount.get(f.id).n,
+  }));
+  if (hasLoc && Number.isFinite(radius) && radius > 0) out = out.filter((f) => f.distance_miles <= radius);
+  if (TYPE_TEST[type]) out = out.filter(TYPE_TEST[type]);
+  if (product) out = out.filter((f) => f.items.some((i) => i.category === product));
+  // Older filters, still accepted
   if (looking === 'produce') out = out.filter((f) => f.items.length > 0);
   else if (looking === 'exp') out = out.filter((f) => f.experiences.length > 0);
   else if (looking.startsWith('exp:')) out = out.filter((f) => f.experiences.some((e) => e.type === looking.slice(4)));
-
-  if (hasLoc && Number.isFinite(radius) && radius > 0) {
-    out = out.filter((f) => f.distance_miles <= radius);
-  }
-  const wantExp = looking.startsWith('exp');
-  if (category && !wantExp) out = out.filter((f) => f.items.some((i) => i.category === category));
-  if (fulfillment === 'pickup' && !wantExp) out = out.filter((f) => f.pickup_enabled);
-  if (fulfillment === 'delivery' && !wantExp) {
-    out = out.filter(
-      (f) =>
-        f.delivery_enabled &&
-        (!hasLoc || f.distance_miles <= f.delivery_radius_miles)
-    );
-  }
+  if (fulfillment === 'pickup') out = out.filter((f) => f.pickup_enabled && f.items.length);
+  if (fulfillment === 'delivery') out = out.filter((f) => f.delivery_enabled && (!hasLoc || f.distance_miles <= f.delivery_radius_miles));
   if (q) {
-    out = out.filter(
-      (f) =>
-        f.name.toLowerCase().includes(q) ||
-        f.city.toLowerCase().includes(q) ||
-        f.items.some((i) => i.name.toLowerCase().includes(q)) ||
-        f.experiences.some((e) => e.title.toLowerCase().includes(q) || (EXP_TYPES[e.type] || '').toLowerCase().includes(q))
-    );
+    const has = (s) => String(s || '').toLowerCase().includes(q);
+    out = out.filter((f) => has(f.name) || has(f.city) || has(f.place_label) || has(f.description) || f.items.some((i) => has(i.name)) ||
+      f.experiences.some((e) => has(e.title) || has(EXP_TYPES[e.type])));
   }
-  // Only show farms that have something for sale or an experience to book, unless a search by name matched.
-  out = out.filter((f) => f.items.length > 0 || f.experiences.length > 0 || (q && f.name.toLowerCase().includes(q)));
-  if (hasLoc) out.sort((a, b) => a.distance_miles - b.distance_miles);
-  res.json({ farms: out });
+  out.sort(hasLoc ? (a, b) => a.distance_miles - b.distance_miles : (a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+app.get('/api/farms', wrap((req, res) => {
+  res.json({ farms: directory({
+    lat: num(req.query.lat), lng: num(req.query.lng), radius: num(req.query.radius), type: str(req.query.type, 20),
+    product: str(req.query.product || req.query.category, 20), q: str(req.query.q, 100).toLowerCase(),
+    fulfillment: str(req.query.fulfillment, 20), looking: str(req.query.looking, 20),
+  }) });
 }));
 
 app.get('/api/farms/:id', wrap((req, res) => {
   const farm = db.prepare('SELECT * FROM farms WHERE id = ?').get(req.params.id);
   if (!farm) throw fail(404, 'Farm not found.');
-  const items = db
-    .prepare('SELECT * FROM listings WHERE farm_id = ? AND active = 1 ORDER BY name')
-    .all(farm.id);
-  const posts = db.prepare('SELECT * FROM posts WHERE farm_id = ? ORDER BY id DESC LIMIT 10').all(farm.id).map(publicPost);
-  res.json({ farm: publicFarm(farm), listings: items, posts, experiences: activeExperiences.all(farm.id).map(publicExp) });
+  const items = db.prepare('SELECT * FROM listings WHERE farm_id = ? AND active = 1 ORDER BY name').all(farm.id);
+  const posts = db.prepare('SELECT * FROM posts WHERE farm_id = ? ORDER BY id DESC LIMIT 20').all(farm.id).map(publicPost);
+  const csa = db.prepare('SELECT * FROM csa_shares WHERE farm_id = ? AND active = 1 AND removed = 0 ORDER BY id').all(farm.id).map(publicShare);
+  const events = db.prepare('SELECT * FROM events WHERE farm_id = ? AND removed = 0 AND date >= ? ORDER BY date, start_time').all(farm.id, today()).map(publicEvent);
+  res.json({ farm: publicFarm(farm), listings: items, posts, experiences: activeExperiences.all(farm.id).map(publicExp), csa, events });
+}));
+
+// ---------- places: city pages and search ----------
+app.get('/api/places', wrap((req, res) => res.json({ places: cities.search(str(req.query.q, 80)) })));
+app.get('/api/places/near', wrap((req, res) => {
+  const lat = num(req.query.lat), lng = num(req.query.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw fail(400, 'Give lat and lng.');
+  res.json({ place: cities.nearest(lat, lng) });
+}));
+app.get('/api/places/:slug', wrap((req, res) => {
+  const place = cities.bySlug(req.params.slug);
+  if (!place) throw fail(404, 'We could not find that town.');
+  res.json({ place });
+}));
+// Towns that have listings, busiest first ("see more cities")
+app.get('/api/cities', wrap((_req, res) => {
+  const rows = db.prepare("SELECT place_slug AS slug, place_label AS label, COUNT(*) AS n FROM farms WHERE place_slug != '' GROUP BY place_slug ORDER BY n DESC, label LIMIT 500").all();
+  res.json({ cities: rows });
+}));
+
+// What's in season: listings nearby plus a typical list for the hemisphere and month.
+const SEASONAL = {
+  winter: ['Citrus', 'Kale', 'Collard greens', 'Cabbage', 'Carrots', 'Turnips', 'Spinach', 'Lettuce', 'Pecans', 'Sweet potatoes'],
+  spring: ['Strawberries', 'Asparagus', 'Peas', 'Lettuce', 'Spinach', 'Radishes', 'Green onions', 'Herbs', 'Eggs'],
+  summer: ['Tomatoes', 'Peaches', 'Blackberries', 'Sweet corn', 'Zucchini', 'Peppers', 'Okra', 'Watermelon', 'Cucumbers', 'Green beans'],
+  fall: ['Apples', 'Pumpkins', 'Winter squash', 'Sweet potatoes', 'Pecans', 'Pears', 'Persimmons', 'Kale', 'Broccoli', 'Carrots', 'Beets', 'Turnips'],
+};
+function seasonFor(lat) {
+  const m = new Date().getUTCMonth(); // 0-11
+  const north = ['winter', 'winter', 'spring', 'spring', 'spring', 'summer', 'summer', 'summer', 'fall', 'fall', 'fall', 'winter'][m];
+  const flip = { winter: 'summer', summer: 'winter', spring: 'fall', fall: 'spring' };
+  return lat < 0 ? flip[north] : north;
+}
+
+// Everything a city page shows, in one request.
+app.get('/api/local', wrap((req, res) => {
+  const lat = num(req.query.lat), lng = num(req.query.lng), radius = num(req.query.radius) || 50;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw fail(400, 'Give lat and lng.');
+  const all = directory({ lat, lng, radius });
+  const counts = Object.fromEntries(Object.keys(TYPE_TEST).map((k) => [k, all.filter(TYPE_TEST[k]).length]));
+  counts.all = all.length;
+  const ids = new Set(all.map((f) => f.id));
+  const card = (f) => ({ id: f.id, name: f.name, kind: f.kind, place_label: f.place_label, distance_miles: f.distance_miles, cover_url: f.cover_url,
+    description: f.description, hours: f.hours, item_count: f.items.length, csa_count: f.csa_count, event_count: f.event_count, accepts_snap: f.accepts_snap });
+  const featured = [...all].sort((a, b) => (!!b.cover_url - !!a.cover_url) || (b.post_count + b.items.length + b.experiences.length * 2 + b.csa_count * 2) - (a.post_count + a.items.length + a.experiences.length * 2 + a.csa_count * 2) || a.distance_miles - b.distance_miles)
+    .filter((f) => f.kind !== 'market').slice(0, 6).map(card);
+  const markets = all.filter((f) => f.kind === 'market').slice(0, 6).map(card);
+  const products = {};
+  for (const f of all) for (const c of new Set(f.items.map((i) => i.category))) products[c] = (products[c] || 0) + 1;
+  const nearbyItems = {};
+  for (const f of all) for (const i of f.items) { const k = i.name.toLowerCase(); (nearbyItems[k] ||= { name: i.name, farms: 0 }).farms++; }
+  const season = seasonFor(lat);
+  const events = db.prepare('SELECT * FROM events WHERE removed = 0 AND date >= ? ORDER BY date, start_time').all(today())
+    .filter((e) => ids.has(e.farm_id)).slice(0, 8).map((e) => ({ ...publicEvent(e), farm_name: all.find((f) => f.id === e.farm_id).name }));
+  const experiences = all.flatMap((f) => f.experiences.map((e) => ({ ...e, farm_name: f.name, currency: f.currency, distance_miles: f.distance_miles }))).slice(0, 8);
+  const csa = db.prepare('SELECT * FROM csa_shares WHERE active = 1 AND removed = 0').all().filter((c) => ids.has(c.farm_id))
+    .map((c) => { const f = all.find((x) => x.id === c.farm_id); return { ...publicShare(c), farm_name: f.name, currency: f.currency, distance_miles: f.distance_miles }; })
+    .sort((a, b) => a.distance_miles - b.distance_miles).slice(0, 6);
+  res.json({
+    counts, featured, markets, events, experiences, csa,
+    products: Object.entries(products).sort((a, b) => b[1] - a[1]).map(([category, farms]) => ({ category, farms })),
+    gallery: gallery(ids, 12),
+    in_season: { season, nearby: Object.values(nearbyItems).sort((a, b) => b.farms - a.farms).slice(0, 16), typical: SEASONAL[season] },
+  });
+}));
+
+function gallery(ids, limit) {
+  const out = [];
+  for (const f of db.prepare("SELECT id, name, cover_url FROM farms WHERE cover_url != ''").all()) if (!ids || ids.has(f.id)) out.push({ url: f.cover_url, type: 'image', farm_id: f.id, farm_name: f.name, caption: f.name, at: '' });
+  for (const p of db.prepare('SELECT p.*, f.name AS farm_name FROM posts p JOIN farms f ON f.id = p.farm_id ORDER BY p.id DESC LIMIT 400').all()) {
+    if (ids && !ids.has(p.farm_id)) continue;
+    for (const m of publicPost(p).media) out.push({ url: m.url, type: m.type, farm_id: p.farm_id, farm_name: p.farm_name, caption: p.body.slice(0, 120), at: p.created_at });
+  }
+  return out.sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, limit);
+}
+app.get('/api/gallery', wrap((req, res) => {
+  const lat = num(req.query.lat), lng = num(req.query.lng), radius = num(req.query.radius) || 50;
+  const ids = Number.isFinite(lat) && Number.isFinite(lng) ? new Set(directory({ lat, lng, radius }).map((f) => f.id)) : null;
+  res.json({ photos: gallery(ids, 120) });
 }));
 
 // ---------- farmer: farms ----------
@@ -239,16 +328,17 @@ function farmFromBody(b) {
   if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
     throw fail(400, 'Pick your farm location on the map.');
   }
-  const kinds = ['farm', 'barn', 'orchard', 'ranch', 'garden'];
   const delivery = !!b.delivery_enabled;
   const radius = delivery ? Math.max(0, num(b.delivery_radius_miles) || 0) : 0;
   const fee = delivery ? Math.max(0, Math.round((num(b.delivery_fee) || 0) * 100)) : 0;
   const pickup = b.pickup_enabled !== false;
-  if (!pickup && !delivery) throw fail(400, 'Enable pickup, delivery, or both.');
   if (delivery && radius <= 0) throw fail(400, 'Set a delivery radius in miles.');
+  let website = str(b.website, 200);
+  if (website && !/^https?:\/\//i.test(website)) website = 'https://' + website;
+  if (website && !/^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(website)) throw fail(400, 'That website address does not look right.');
   return {
     name,
-    kind: kinds.includes(b.kind) ? b.kind : 'farm',
+    kind: KINDS.includes(b.kind) ? b.kind : 'farm',
     description: str(b.description, 1000),
     address: str(b.address, 200),
     city: str(b.city, 80),
@@ -262,6 +352,10 @@ function farmFromBody(b) {
     delivery_fee_cents: fee,
     payment_note: str(b.payment_note, 300) || 'Pay the farmer directly at pickup or delivery.',
     currency: /^[A-Z]{3}$/.test(b.currency || '') ? b.currency : 'USD',
+    accepts_snap: b.accepts_snap ? 1 : 0,
+    wholesale: b.wholesale ? 1 : 0,
+    website,
+    hours: str(b.hours, 120),
   };
 }
 
@@ -269,18 +363,22 @@ app.get('/api/my/farms', requireAuth('farmer'), wrap((req, res) => {
   const farms = db.prepare('SELECT * FROM farms WHERE owner_id = ? ORDER BY id').all(req.user.id);
   const stmt = db.prepare('SELECT * FROM listings WHERE farm_id = ? AND active = 1 ORDER BY name');
   const exps = db.prepare('SELECT * FROM experiences WHERE farm_id = ? AND removed = 0 ORDER BY id');
-  res.json({ farms: farms.map((f) => ({ ...publicFarm(f), listings: stmt.all(f.id), experiences: exps.all(f.id).map(publicExp) })) });
+  const shares = db.prepare('SELECT * FROM csa_shares WHERE farm_id = ? AND removed = 0 ORDER BY id');
+  const evs = db.prepare('SELECT * FROM events WHERE farm_id = ? AND removed = 0 ORDER BY date DESC, start_time');
+  res.json({ farms: farms.map((f) => ({ ...publicFarm(f), listings: stmt.all(f.id), experiences: exps.all(f.id).map(publicExp),
+    csa: shares.all(f.id).map(publicShare), events: evs.all(f.id).map(publicEvent) })) });
 }));
 
 app.post('/api/farms', requireAuth('farmer'), wrap((req, res) => {
   const f = farmFromBody(req.body);
   const r = db
     .prepare(`INSERT INTO farms (owner_id,name,kind,description,address,city,lat,lng,phone,
-      pickup_enabled,pickup_instructions,delivery_enabled,delivery_radius_miles,delivery_fee_cents,payment_note,currency)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      pickup_enabled,pickup_instructions,delivery_enabled,delivery_radius_miles,delivery_fee_cents,payment_note,currency,accepts_snap,wholesale,website,hours)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(req.user.id, f.name, f.kind, f.description, f.address, f.city, f.lat, f.lng, f.phone,
       f.pickup_enabled, f.pickup_instructions, f.delivery_enabled, f.delivery_radius_miles,
-      f.delivery_fee_cents, f.payment_note, f.currency);
+      f.delivery_fee_cents, f.payment_note, f.currency, f.accepts_snap, f.wholesale, f.website, f.hours);
+  setPlace(Number(r.lastInsertRowid));
   res.status(201).json({ id: Number(r.lastInsertRowid) });
 }));
 
@@ -289,17 +387,19 @@ app.put('/api/farms/:id', requireAuth('farmer'), wrap((req, res) => {
   const f = farmFromBody(req.body);
   db.prepare(`UPDATE farms SET name=?,kind=?,description=?,address=?,city=?,lat=?,lng=?,phone=?,
       pickup_enabled=?,pickup_instructions=?,delivery_enabled=?,delivery_radius_miles=?,
-      delivery_fee_cents=?,payment_note=?,currency=? WHERE id=?`)
+      delivery_fee_cents=?,payment_note=?,currency=?,accepts_snap=?,wholesale=?,website=?,hours=? WHERE id=?`)
     .run(f.name, f.kind, f.description, f.address, f.city, f.lat, f.lng, f.phone,
       f.pickup_enabled, f.pickup_instructions, f.delivery_enabled, f.delivery_radius_miles,
-      f.delivery_fee_cents, f.payment_note, f.currency, req.params.id);
+      f.delivery_fee_cents, f.payment_note, f.currency, f.accepts_snap, f.wholesale, f.website, f.hours, req.params.id);
+  setPlace(Number(req.params.id));
   res.json({ ok: true });
 }));
 
 // ---------- farmer: listings (post yield) ----------
 function listingFromBody(b) {
   const name = str(b.name, 120);
-  const cats = ['vegetable', 'fruit', 'herb', 'other'];
+  const legacy = { vegetable: 'vegetables', herb: 'herbs' };
+  const cat = legacy[b.category] || b.category;
   const price = num(b.price);
   const qty = num(b.qty_available);
   if (!name) throw fail(400, 'Item name is required.');
@@ -307,7 +407,7 @@ function listingFromBody(b) {
   if (!Number.isFinite(qty) || qty < 0) throw fail(400, 'Enter a valid quantity.');
   return {
     name,
-    category: cats.includes(b.category) ? b.category : 'vegetable',
+    category: CATEGORIES.includes(cat) ? cat : 'vegetables',
     unit: str(b.unit, 20) || 'lb',
     price_cents: Math.round(price * 100),
     qty_available: qty,
@@ -527,6 +627,144 @@ app.patch('/api/bookings/:id/status', requireAuth(), wrap((req, res) => {
   res.json({ ok: true });
 }));
 
+// ---------- CSA shares (subscriptions) ----------
+const CSA_PER = { week: 'per week', month: 'per month', season: 'per season' };
+function publicShare(c) {
+  const taken = db.prepare("SELECT COUNT(*) AS n FROM csa_signups WHERE share_id = ? AND status IN ('requested','confirmed')").get(c.id).n;
+  return { id: c.id, farm_id: c.farm_id, name: c.name, about: c.about, price_cents: c.price_cents, per: c.per, season: c.season, pickup: c.pickup,
+    spots: c.spots, spots_left: Math.max(0, c.spots - taken), active: !!c.active };
+}
+function shareFromBody(b) {
+  const name = str(b.name, 100); if (!name) throw fail(400, 'Name the share, for example "Full vegetable share".');
+  const price = num(b.price === '' || b.price === undefined ? 0 : b.price); if (!(price >= 0)) throw fail(400, 'Enter a price.');
+  const spots = Math.floor(num(b.spots)); if (!(spots >= 1)) throw fail(400, 'Enter how many members you can take.');
+  return { name, about: str(b.about, 1000), price_cents: Math.round(price * 100), per: CSA_PER[b.per] ? b.per : 'week',
+    season: str(b.season, 100), pickup: str(b.pickup, 200), spots };
+}
+function ownedShare(id, userId) {
+  const row = db.prepare('SELECT c.*, f.owner_id FROM csa_shares c JOIN farms f ON f.id = c.farm_id WHERE c.id = ? AND c.removed = 0').get(id);
+  if (!row) throw fail(404, 'Share not found.'); if (row.owner_id !== userId) throw fail(403, 'That is not your share.'); return row;
+}
+app.post('/api/farms/:id/csa', requireAuth('farmer'), wrap((req, res) => {
+  ownedFarm(req.params.id, req.user.id); const c = shareFromBody(req.body);
+  const r = db.prepare('INSERT INTO csa_shares (farm_id,name,about,price_cents,per,season,pickup,spots) VALUES (?,?,?,?,?,?,?,?)')
+    .run(req.params.id, c.name, c.about, c.price_cents, c.per, c.season, c.pickup, c.spots);
+  res.status(201).json({ id: Number(r.lastInsertRowid) });
+}));
+app.put('/api/csa/:id', requireAuth('farmer'), wrap((req, res) => {
+  ownedShare(req.params.id, req.user.id); const c = shareFromBody(req.body);
+  db.prepare('UPDATE csa_shares SET name=?,about=?,price_cents=?,per=?,season=?,pickup=?,spots=? WHERE id=?').run(c.name, c.about, c.price_cents, c.per, c.season, c.pickup, c.spots, req.params.id);
+  res.json({ ok: true });
+}));
+app.patch('/api/csa/:id/active', requireAuth('farmer'), wrap((req, res) => {
+  ownedShare(req.params.id, req.user.id); db.prepare('UPDATE csa_shares SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, req.params.id); res.json({ ok: true });
+}));
+app.delete('/api/csa/:id', requireAuth('farmer'), wrap((req, res) => {
+  ownedShare(req.params.id, req.user.id); db.prepare('UPDATE csa_shares SET removed = 1, active = 0 WHERE id = ?').run(req.params.id); res.json({ ok: true });
+}));
+app.post('/api/csa/:id/signup', requireAuth('buyer'), wrap((req, res) => {
+  const c = db.prepare('SELECT * FROM csa_shares WHERE id = ? AND active = 1 AND removed = 0').get(req.params.id);
+  if (!c) throw fail(404, 'This share is no longer offered.');
+  const contact = str(req.body.contact, 120); if (!contact) throw fail(400, 'Add a phone number or email so the farmer can reach you.');
+  if (db.prepare("SELECT 1 FROM csa_signups WHERE share_id = ? AND buyer_id = ? AND status IN ('requested','confirmed')").get(c.id, req.user.id)) throw fail(409, 'You already signed up for this share.');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (publicShare(c).spots_left < 1) throw fail(409, 'This share is full for the season.');
+    const r = db.prepare('INSERT INTO csa_signups (buyer_id,share_id,farm_id,title,price_cents,per,contact,note) VALUES (?,?,?,?,?,?,?,?)')
+      .run(req.user.id, c.id, c.farm_id, c.name, c.price_cents, c.per, contact, str(req.body.note, 500));
+    db.exec('COMMIT');
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+}));
+app.get('/api/csa-signups/mine', requireAuth('buyer'), wrap((req, res) => {
+  res.json({ signups: db.prepare(`SELECT s.*, f.name AS farm_name, f.currency, f.phone AS farm_phone, f.payment_note, c.season, c.pickup
+    FROM csa_signups s JOIN farms f ON f.id = s.farm_id JOIN csa_shares c ON c.id = s.share_id WHERE s.buyer_id = ? ORDER BY s.id DESC`).all(req.user.id) });
+}));
+app.get('/api/farm-csa-signups', requireAuth('farmer'), wrap((req, res) => {
+  res.json({ signups: db.prepare(`SELECT s.*, f.currency, u.name AS buyer_name, u.email AS buyer_email FROM csa_signups s
+    JOIN farms f ON f.id = s.farm_id JOIN users u ON u.id = s.buyer_id WHERE f.owner_id = ? ORDER BY s.id DESC`).all(req.user.id) });
+}));
+app.patch('/api/csa-signups/:id/status', requireAuth(), wrap((req, res) => {
+  const s = db.prepare('SELECT s.*, f.owner_id FROM csa_signups s JOIN farms f ON f.id = s.farm_id WHERE s.id = ?').get(req.params.id);
+  if (!s) throw fail(404, 'Sign-up not found.');
+  const isFarmer = req.user.role === 'farmer' && s.owner_id === req.user.id, isMember = req.user.role === 'buyer' && s.buyer_id === req.user.id;
+  if (!isFarmer && !isMember) throw fail(403, 'Not your sign-up.');
+  const allowed = isFarmer ? { requested: ['confirmed', 'declined'], confirmed: ['cancelled'] } : { requested: ['cancelled'], confirmed: ['cancelled'] };
+  if (!(allowed[s.status] || []).includes(req.body.status)) throw fail(400, `This sign-up is ${s.status} and can't be changed that way.`);
+  db.prepare('UPDATE csa_signups SET status = ? WHERE id = ?').run(req.body.status, s.id);
+  res.json({ ok: true });
+}));
+
+// ---------- events ----------
+function publicEvent(e) {
+  const going = db.prepare("SELECT COALESCE(SUM(people),0) AS n FROM event_rsvps WHERE event_id = ? AND status = 'going'").get(e.id).n;
+  return { id: e.id, farm_id: e.farm_id, title: e.title, about: e.about, date: e.date, start_time: e.start_time, end_time: e.end_time,
+    location: e.location, price_cents: e.price_cents, capacity: e.capacity, going, spots_left: e.capacity > 0 ? Math.max(0, e.capacity - going) : null };
+}
+function eventFromBody(b) {
+  const title = str(b.title, 120); if (!title) throw fail(400, 'Give the event a name.');
+  const date = str(b.date, 10); if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw fail(400, 'Pick the date.');
+  const time = (v) => (/^\d{2}:\d{2}$/.test(v || '') ? v : '');
+  const price = num(b.price === '' || b.price === undefined ? 0 : b.price); if (!(price >= 0)) throw fail(400, 'Enter a price, or 0 if it is free.');
+  return { title, about: str(b.about, 1000), date, start_time: time(b.start_time), end_time: time(b.end_time), location: str(b.location, 200),
+    price_cents: Math.round(price * 100), capacity: Math.max(0, Math.floor(num(b.capacity) || 0)) };
+}
+function ownedEvent(id, userId) {
+  const row = db.prepare('SELECT e.*, f.owner_id FROM events e JOIN farms f ON f.id = e.farm_id WHERE e.id = ? AND e.removed = 0').get(id);
+  if (!row) throw fail(404, 'Event not found.'); if (row.owner_id !== userId) throw fail(403, 'That is not your event.'); return row;
+}
+app.get('/api/events', wrap((req, res) => {
+  const lat = num(req.query.lat), lng = num(req.query.lng), radius = num(req.query.radius) || 50;
+  const near = Number.isFinite(lat) && Number.isFinite(lng) ? new Map(directory({ lat, lng, radius }).map((f) => [f.id, f])) : null;
+  const farms = new Map(db.prepare('SELECT * FROM farms').all().map((f) => [f.id, f]));
+  const rows = db.prepare('SELECT * FROM events WHERE removed = 0 AND date >= ? ORDER BY date, start_time LIMIT 300').all(today())
+    .filter((e) => !near || near.has(e.farm_id))
+    .map((e) => { const f = farms.get(e.farm_id); return { ...publicEvent(e), farm_name: f.name, farm_kind: f.kind, place_label: f.place_label, currency: f.currency,
+      distance_miles: near ? near.get(e.farm_id).distance_miles : null }; });
+  res.json({ events: rows });
+}));
+app.post('/api/farms/:id/events', requireAuth('farmer'), wrap((req, res) => {
+  const farm = ownedFarm(req.params.id, req.user.id); const e = eventFromBody(req.body);
+  const r = db.prepare('INSERT INTO events (farm_id,title,about,date,start_time,end_time,location,price_cents,capacity) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(farm.id, e.title, e.about, e.date, e.start_time, e.end_time, e.location || farm.name, e.price_cents, e.capacity);
+  res.status(201).json({ id: Number(r.lastInsertRowid) });
+}));
+app.put('/api/events/:id', requireAuth('farmer'), wrap((req, res) => {
+  ownedEvent(req.params.id, req.user.id); const e = eventFromBody(req.body);
+  db.prepare('UPDATE events SET title=?,about=?,date=?,start_time=?,end_time=?,location=?,price_cents=?,capacity=? WHERE id=?')
+    .run(e.title, e.about, e.date, e.start_time, e.end_time, e.location, e.price_cents, e.capacity, req.params.id);
+  res.json({ ok: true });
+}));
+app.delete('/api/events/:id', requireAuth('farmer'), wrap((req, res) => {
+  ownedEvent(req.params.id, req.user.id); db.prepare('UPDATE events SET removed = 1 WHERE id = ?').run(req.params.id); res.json({ ok: true });
+}));
+app.post('/api/events/:id/rsvp', requireAuth('buyer'), wrap((req, res) => {
+  const e = db.prepare('SELECT * FROM events WHERE id = ? AND removed = 0').get(req.params.id);
+  if (!e || e.date < today()) throw fail(404, 'This event is over or was cancelled.');
+  const people = Math.floor(num(req.body.people)); if (!(people >= 1)) throw fail(400, 'Enter how many people are coming.');
+  if (db.prepare("SELECT 1 FROM event_rsvps WHERE event_id = ? AND buyer_id = ? AND status = 'going'").get(e.id, req.user.id)) throw fail(409, "You're already going to this event.");
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const left = publicEvent(e).spots_left;
+    if (left !== null && people > left) throw fail(409, left ? `Only ${left} ${left === 1 ? 'spot is' : 'spots are'} left.` : 'This event is full.');
+    const r = db.prepare('INSERT INTO event_rsvps (buyer_id,event_id,farm_id,people,contact) VALUES (?,?,?,?,?)').run(req.user.id, e.id, e.farm_id, people, str(req.body.contact, 120));
+    db.exec('COMMIT'); res.status(201).json({ id: Number(r.lastInsertRowid) });
+  } catch (ex) { db.exec('ROLLBACK'); throw ex; }
+}));
+app.get('/api/rsvps/mine', requireAuth('buyer'), wrap((req, res) => {
+  res.json({ rsvps: db.prepare(`SELECT r.*, e.title, e.date, e.start_time, e.end_time, e.location, e.price_cents, f.name AS farm_name, f.currency, f.lat, f.lng, f.address
+    FROM event_rsvps r JOIN events e ON e.id = r.event_id JOIN farms f ON f.id = r.farm_id WHERE r.buyer_id = ? ORDER BY e.date DESC`).all(req.user.id) });
+}));
+app.get('/api/farm-rsvps', requireAuth('farmer'), wrap((req, res) => {
+  res.json({ rsvps: db.prepare(`SELECT r.*, e.title, e.date, u.name AS buyer_name, u.email AS buyer_email FROM event_rsvps r JOIN events e ON e.id = r.event_id
+    JOIN farms f ON f.id = r.farm_id JOIN users u ON u.id = r.buyer_id WHERE f.owner_id = ? ORDER BY e.date, r.id`).all(req.user.id) });
+}));
+app.patch('/api/rsvps/:id/cancel', requireAuth('buyer'), wrap((req, res) => {
+  const r = db.prepare('SELECT * FROM event_rsvps WHERE id = ? AND buyer_id = ?').get(req.params.id, req.user.id);
+  if (!r) throw fail(404, 'RSVP not found.');
+  db.prepare("UPDATE event_rsvps SET status = 'cancelled' WHERE id = ?").run(r.id); res.json({ ok: true });
+}));
+
 // ---------- orders ----------
 // Reserving holds stock. Payment happens directly between buyer and farmer; the platform takes no cut.
 app.post('/api/orders', requireAuth('buyer'), wrap((req, res) => {
@@ -650,6 +888,8 @@ app.patch('/api/orders/:id/status', requireAuth(), wrap((req, res) => {
 }));
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found.' }));
+// Every other page address (/, /celina-tx, /farm/12, /dashboard...) is handled by the single-page app.
+app.get(/^\/(?!uploads\/).*/, (_req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
